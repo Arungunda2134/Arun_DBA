@@ -1,0 +1,843 @@
+Here is the complete 360-degree SQL Server replication monitoring script without emojis, clean and professional:
+
+```sql
+/*
+================================================================================
+    360 DEGREE SQL SERVER REPLICATION MONITORING SCRIPT
+    
+    Monitors:
+    - Latency (Publisher to Distributor to Subscriber)
+    - Pending/Undistributed Commands
+    - Agent Status (LogReader, Distribution, Snapshot)
+    - Replication Errors (MSrepl_errors)
+    - Job Status and Execution History
+    - Estimated Time to Apply Commands
+    - Performance Ratings
+    
+    Author: DBA Team
+    Version: 2.0
+    Date: 2025-11-05
+================================================================================
+*/
+
+SET NOCOUNT ON;
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+-- Variable declarations
+DECLARE @Publisher SYSNAME, 
+        @PublisherDB SYSNAME, 
+        @Publication SYSNAME, 
+        @Distdb SYSNAME, 
+        @Subscriber SYSNAME, 
+        @SubscriberDB SYSNAME,
+        @Sqltext NVARCHAR(MAX),
+        @profile_name NVARCHAR(128),
+        @server_name NVARCHAR(128),
+        @subject NVARCHAR(256),
+        @html NVARCHAR(MAX),
+        @ErrorCount INT = 0,
+        @CriticalCount INT = 0;
+
+BEGIN TRY
+
+    PRINT '========================================';
+    PRINT '360 REPLICATION MONITORING - STARTED';
+    PRINT 'Server: ' + @@SERVERNAME;
+    PRINT 'Time: ' + CONVERT(VARCHAR, GETDATE(), 120);
+    PRINT '========================================';
+
+    -- ============================================================================
+    -- STEP 1: CREATE TEMPORARY TABLES
+    -- ============================================================================
+    
+    IF OBJECT_ID('tempdb..#REPLMONITORPUBLISHER') IS NOT NULL DROP TABLE #REPLMONITORPUBLISHER;
+    CREATE TABLE #REPLMONITORPUBLISHER (
+        SN INT IDENTITY(1,1),
+        PUBLISHER SYSNAME NULL,
+        DISTRIBUTION_DB SYSNAME NULL,
+        STATUS INT NULL,
+        WARNING INT NULL,
+        PUBLICATIONCOUNT INT NULL,
+        RETURNSTAMP VARCHAR(100) NULL
+    );
+
+    IF OBJECT_ID('tempdb..#REPLMONITORSUBSCRIPTION') IS NOT NULL DROP TABLE #REPLMONITORSUBSCRIPTION;
+    CREATE TABLE #REPLMONITORSUBSCRIPTION (
+        SN INT IDENTITY(1,1),
+        PUBLISHER SYSNAME NULL,
+        DISTRIBUTION_DB SYSNAME NULL,
+        STATUS INT NULL,
+        WARNING INT NULL,
+        SUBSCRIBER SYSNAME NULL,
+        SUBSCRIBER_DB SYSNAME NULL,
+        PUBLISHER_DB SYSNAME NULL,
+        PUBLICATION SYSNAME NULL,
+        PUBLICATION_TYPE INT NULL,
+        SUBTYPE INT NULL,
+        LATENCY INT NULL,
+        LATENCYTHRESHOLD FLOAT NULL,
+        AGENTNOTRUNNING INT NULL,
+        AGENTNOTRUNNINGTHRESHOLD INT NULL,
+        TIMETOEXPIRATION INT NULL,
+        EXPIRATIONTHRESHOLD INT NULL,
+        LAST_DISTSYNC DATETIME NULL,
+        DISTRIBUTION_AGENTNAME SYSNAME NULL,
+        MONITORRANKING INT NULL,
+        DISTRIBUTIONAGENTJOBID BINARY(16) NULL,
+        DISTRIBUTIONAGENTID INT NULL,
+        DISTRIBUTIONAGENTPROFILEID INT NULL,
+        LOGREADERAGENTNAME SYSNAME NULL
+    );
+
+    IF OBJECT_ID('tempdb..#REPLLOGREADERAGENT') IS NOT NULL DROP TABLE #REPLLOGREADERAGENT;
+    CREATE TABLE #REPLLOGREADERAGENT (
+        SN INT IDENTITY(1,1),
+        DBNAME SYSNAME NULL,
+        NAME SYSNAME NULL,
+        STATUS INT NULL,
+        PUBLISHER SYSNAME NULL,
+        PUBLISHER_DB SYSNAME NULL,
+        START_TIME DATETIME NULL,
+        TIME DATETIME NULL,
+        DURATION INT NULL,
+        COMMENTS NVARCHAR(1000),
+        DELIVERY_TIME INT NULL,
+        DELIVERED_TRANSACTIONS INT NULL,
+        DELIVERED_COMMANDS INT NULL,
+        AVERAGE_COMMANDS INT NULL,
+        DELIVERY_RATE INT NULL,
+        DELIVERY_LATENCY INT NULL,
+        ERROR_ID INT NULL,
+        JOB_ID BINARY(16) NULL,
+        LOCAL_JOB INT NULL,
+        PROFILE_ID INT NULL,
+        AGENT_ID INT NULL,
+        LOCAL_TIMESTAMP BINARY(8) NULL
+    );
+
+    IF OBJECT_ID('tempdb..#REPLDISTRIBUTORAGENT') IS NOT NULL DROP TABLE #REPLDISTRIBUTORAGENT;
+    CREATE TABLE #REPLDISTRIBUTORAGENT (
+        SN INT IDENTITY(1,1),
+        DBNAME SYSNAME NULL,
+        NAME SYSNAME NULL,
+        STATUS INT NULL,
+        PUBLISHER SYSNAME NULL,
+        PUBLISHER_DB SYSNAME NULL,
+        PUBLICATION SYSNAME NULL,
+        SUBSCRIBER SYSNAME NULL,
+        SUBSCRIBER_DB SYSNAME NULL,
+        SUBSCRIPTION_TYPE INT NULL,
+        START_TIME DATETIME NULL,
+        TIME DATETIME NULL,
+        DURATION INT NULL,
+        COMMENTS NVARCHAR(1000),
+        DELIVERY_TIME INT NULL,
+        DELIVERED_TRANSACTIONS INT NULL,
+        DELIVERED_COMMANDS INT NULL,
+        AVERAGE_COMMANDS INT NULL,
+        DELIVERY_RATE INT NULL,
+        DELIVERY_LATENCY INT NULL,
+        ERROR_ID INT NULL,
+        JOB_ID BINARY(16) NULL,
+        LOCAL_JOB INT NULL,
+        PROFILE_ID INT NULL,
+        AGENT_ID INT NULL,
+        LOCAL_TIMESTAMP BINARY(8) NULL,
+        OFFLOAD_ENABLED BIT NULL,
+        OFFLOAD_SERVER VARCHAR(50),
+        SUBSCRIBER_TYPE INT NULL
+    );
+
+    -- Pending Commands Table
+    IF OBJECT_ID('tempdb..#PENDINGCOMMANDS') IS NOT NULL DROP TABLE #PENDINGCOMMANDS;
+    CREATE TABLE #PENDINGCOMMANDS (
+        PUBLISHER SYSNAME,
+        PUBLISHER_DB SYSNAME,
+        PUBLICATION SYSNAME,
+        SUBSCRIBER SYSNAME,
+        SUBSCRIBER_DB SYSNAME,
+        PENDINGCMDCOUNT INT,
+        ESTIMATEDPROCESSTIME INT
+    );
+
+    -- Replication Errors Table
+    IF OBJECT_ID('tempdb..#REPLERRORS') IS NOT NULL DROP TABLE #REPLERRORS;
+    CREATE TABLE #REPLERRORS (
+        ERROR_ID INT,
+        ERROR_TIME DATETIME,
+        ERROR_TEXT NVARCHAR(MAX),
+        XactSeqNo VARBINARY(16),
+        CommandID INT,
+        SessionID INT
+    );
+
+    -- Agent Jobs Status Table
+    IF OBJECT_ID('tempdb..#AGENTJOBS') IS NOT NULL DROP TABLE #AGENTJOBS;
+    CREATE TABLE #AGENTJOBS (
+        JobName SYSNAME,
+        JobID UNIQUEIDENTIFIER,
+        Enabled TINYINT,
+        LastRunStatus INT,
+        LastRunDate INT,
+        LastRunTime INT,
+        LastRunOutcome VARCHAR(20),
+        NextRunDate INT,
+        NextRunTime INT
+    );
+
+    PRINT 'Step 1: Temp tables created successfully.';
+
+    -- ============================================================================
+    -- STEP 2: COLLECT PUBLISHER INFORMATION
+    -- ============================================================================
+    
+    INSERT INTO #REPLMONITORPUBLISHER
+    SELECT * FROM OPENROWSET('SQLOLEDB', 'SERVER=(LOCAL);TRUSTED_CONNECTION=YES;',
+        'SET FMTONLY OFF EXEC distribution.dbo.sp_replmonitorhelppublisher WITH RESULT SETS
+        ((PUBLISHER SYSNAME NULL, DISTRIBUTION_DB SYSNAME NULL, STATUS INT NULL, 
+          WARNING INT NULL, PUBLICATIONCOUNT INT NULL, RETURNSTAMP VARCHAR(100) NULL))');
+
+    PRINT 'Step 2: Publisher information collected. Publishers found: ' + CAST(@@ROWCOUNT AS VARCHAR);
+
+    -- ============================================================================
+    -- STEP 3: COLLECT LOG READER AGENT STATUS
+    -- ============================================================================
+    
+    INSERT INTO #REPLLOGREADERAGENT
+    SELECT * FROM OPENROWSET('SQLOLEDB','Server=(local);TRUSTED_CONNECTION=YES;',
+        'SET FMTONLY OFF EXEC sp_MSenum_replication_agents @type = 2 WITH RESULT SETS
+        ((DBNAME SYSNAME NULL, NAME SYSNAME NULL, STATUS INT NULL, PUBLISHER SYSNAME NULL,
+          PUBLISHER_DB SYSNAME NULL, START_TIME DATETIME NULL, TIME DATETIME NULL, 
+          DURATION INT NULL, COMMENTS NVARCHAR(1000), DELIVERY_TIME INT NULL,
+          DELIVERED_TRANSACTIONS INT NULL, DELIVERED_COMMANDS INT NULL, 
+          AVERAGE_COMMANDS INT NULL, DELIVERY_RATE INT NULL, DELIVERY_LATENCY INT NULL,
+          ERROR_ID INT NULL, JOB_ID BINARY(16) NULL, LOCAL_JOB INT NULL, 
+          PROFILE_ID INT NULL, AGENT_ID INT NULL, LOCAL_TIMESTAMP BINARY(8) NULL))');
+
+    PRINT 'Step 3: Log Reader Agent status collected. Agents found: ' + CAST(@@ROWCOUNT AS VARCHAR);
+
+    -- ============================================================================
+    -- STEP 4: COLLECT DISTRIBUTION AGENT STATUS
+    -- ============================================================================
+    
+    INSERT INTO #REPLDISTRIBUTORAGENT
+    SELECT * FROM OPENROWSET('SQLOLEDB','Server=(local);TRUSTED_CONNECTION=YES;',
+        'SET FMTONLY OFF EXEC sp_MSenum_replication_agents @type = 3 WITH RESULT SETS
+        ((DBNAME SYSNAME NULL, NAME SYSNAME NULL, STATUS INT NULL, PUBLISHER SYSNAME NULL,
+          PUBLISHER_DB SYSNAME NULL, PUBLICATION SYSNAME NULL, SUBSCRIBER SYSNAME NULL,
+          SUBSCRIBER_DB SYSNAME NULL, SUBSCRIPTION_TYPE INT NULL, START_TIME DATETIME NULL,
+          TIME DATETIME NULL, DURATION INT NULL, COMMENTS NVARCHAR(1000), 
+          DELIVERY_TIME INT NULL, DELIVERED_TRANSACTIONS INT NULL, 
+          DELIVERED_COMMANDS INT NULL, AVERAGE_COMMANDS INT NULL, DELIVERY_RATE INT NULL,
+          DELIVERY_LATENCY INT NULL, ERROR_ID INT NULL, JOB_ID BINARY(16) NULL,
+          LOCAL_JOB INT NULL, PROFILE_ID INT NULL, AGENT_ID INT NULL,
+          LOCAL_TIMESTAMP BINARY(8) NULL, OFFLOAD_ENABLED BIT NULL,
+          OFFLOAD_SERVER VARCHAR(50), SUBSCRIBER_TYPE INT NULL))');
+
+    PRINT 'Step 4: Distribution Agent status collected. Agents found: ' + CAST(@@ROWCOUNT AS VARCHAR);
+
+    -- ============================================================================
+    -- STEP 5: COLLECT SUBSCRIPTION INFORMATION FOR EACH PUBLISHER
+    -- ============================================================================
+    
+    DECLARE CURSORPUBLISHER CURSOR FOR
+    SELECT PUBLISHER, DISTRIBUTION_DB 
+    FROM #REPLMONITORPUBLISHER;
+
+    OPEN CURSORPUBLISHER;
+    FETCH NEXT FROM CURSORPUBLISHER INTO @Publisher, @Distdb;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @Sqltext = 'SELECT ''' + @Publisher + ''', ''' + @Distdb + ''', 
+            STATUS, WARNING, SUBSCRIBER, SUBSCRIBER_DB, PUBLISHER_DB, PUBLICATION, 
+            PUBLICATION_TYPE, SUBTYPE, LATENCY, LATENCYTHRESHOLD, AGENTNOTRUNNING, 
+            AGENTNOTRUNNINGTHRESHOLD, TIMETOEXPIRATION, EXPIRATIONTHRESHOLD, 
+            LAST_DISTSYNC, DISTRIBUTION_AGENTNAME, MONITORRANKING, 
+            DISTRIBUTIONAGENTJOBID, DISTRIBUTIONAGENTID, DISTRIBUTIONAGENTPROFILEID, 
+            LOGREADERAGENTNAME 
+        FROM OPENROWSET(''SQLOLEDB'',''Server=(local);TRUSTED_CONNECTION=YES;'',
+            ''SET FMTONLY OFF EXEC ' + @Distdb + '..sp_replmonitorhelpsubscription 
+            @publisher = ''''' + @Publisher + ''''', @publication_type = 0 WITH RESULT SETS
+            ((STATUS INT NULL, WARNING INT NULL, SUBSCRIBER SYSNAME NULL, 
+              SUBSCRIBER_DB SYSNAME NULL, PUBLISHER_DB SYSNAME NULL, 
+              PUBLICATION SYSNAME NULL, PUBLICATION_TYPE INT NULL, SUBTYPE INT NULL,
+              LATENCY INT NULL, LATENCYTHRESHOLD FLOAT NULL, AGENTNOTRUNNING INT NULL,
+              AGENTNOTRUNNINGTHRESHOLD INT NULL, TIMETOEXPIRATION INT NULL,
+              EXPIRATIONTHRESHOLD INT NULL, LAST_DISTSYNC DATETIME NULL,
+              DISTRIBUTION_AGENTNAME SYSNAME NULL, mergeagentname SYSNAME NULL,
+              mergesubscriptionfriendlyname SYSNAME NULL, mergeagentlocation SYSNAME NULL,
+              mergeconnectiontype SYSNAME NULL, mergePerformance SYSNAME NULL,
+              mergerunspeed INT NULL, mergerunduration INT NULL, MONITORRANKING INT NULL,
+              DISTRIBUTIONAGENTJOBID BINARY(16) NULL, mergeagentjobid INT NULL,
+              DISTRIBUTIONAGENTID INT NULL, DISTRIBUTIONAGENTPROFILEID INT NULL,
+              mergeagentid INT NULL, mergeagentprofileid INT NULL,
+              LOGREADERAGENTNAME SYSNAME NULL, publisher SYSNAME NULL))'')';
+
+        INSERT INTO #REPLMONITORSUBSCRIPTION (
+            PUBLISHER, DISTRIBUTION_DB, STATUS, WARNING, SUBSCRIBER, SUBSCRIBER_DB,
+            PUBLISHER_DB, PUBLICATION, PUBLICATION_TYPE, SUBTYPE, LATENCY,
+            LATENCYTHRESHOLD, AGENTNOTRUNNING, AGENTNOTRUNNINGTHRESHOLD,
+            TIMETOEXPIRATION, EXPIRATIONTHRESHOLD, LAST_DISTSYNC,
+            DISTRIBUTION_AGENTNAME, MONITORRANKING, DISTRIBUTIONAGENTJOBID,
+            DISTRIBUTIONAGENTID, DISTRIBUTIONAGENTPROFILEID, LOGREADERAGENTNAME)
+        EXEC (@Sqltext);
+
+        FETCH NEXT FROM CURSORPUBLISHER INTO @Publisher, @Distdb;
+    END
+
+    CLOSE CURSORPUBLISHER;
+    DEALLOCATE CURSORPUBLISHER;
+
+    PRINT 'Step 5: Subscription information collected.';
+
+    -- ============================================================================
+    -- STEP 6: COLLECT PENDING COMMANDS (CRITICAL METRIC)
+    -- ============================================================================
+    
+    DECLARE @PendingSQL NVARCHAR(MAX);
+
+    DECLARE CURSOR_PENDING CURSOR FOR
+    SELECT DISTINCT PUBLISHER, PUBLISHER_DB, PUBLICATION, SUBSCRIBER, SUBSCRIBER_DB
+    FROM #REPLMONITORSUBSCRIPTION
+    WHERE PUBLICATION_TYPE = 0; -- Transactional only
+
+    OPEN CURSOR_PENDING;
+    FETCH NEXT FROM CURSOR_PENDING INTO @Publisher, @PublisherDB, @Publication, @Subscriber, @SubscriberDB;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        BEGIN TRY
+            SET @PendingSQL = '
+            DECLARE @PendingCmds INT, @EstTime INT;
+            EXEC distribution.dbo.sp_replmonitorsubscriptionpendingcmds 
+                @publisher = ''' + @Publisher + ''',
+                @publisher_db = ''' + @PublisherDB + ''',
+                @publication = ''' + @Publication + ''',
+                @subscriber = ''' + @Subscriber + ''',
+                @subscriber_db = ''' + @SubscriberDB + ''',
+                @subscription_type = 0,
+                @pendingcmdcount = @PendingCmds OUTPUT,
+                @estimatedprocesstime = @EstTime OUTPUT;
+            SELECT ''' + @Publisher + ''' AS PUBLISHER, 
+                   ''' + @PublisherDB + ''' AS PUBLISHER_DB,
+                   ''' + @Publication + ''' AS PUBLICATION,
+                   ''' + @Subscriber + ''' AS SUBSCRIBER,
+                   ''' + @SubscriberDB + ''' AS SUBSCRIBER_DB,
+                   @PendingCmds AS PENDINGCMDCOUNT, 
+                   @EstTime AS ESTIMATEDPROCESSTIME;';
+
+            INSERT INTO #PENDINGCOMMANDS
+            EXEC sp_executesql @PendingSQL;
+
+        END TRY
+        BEGIN CATCH
+            PRINT 'Warning: Could not get pending commands for ' + @Publisher + '.' + @PublisherDB + '.' + @Publication;
+        END CATCH
+
+        FETCH NEXT FROM CURSOR_PENDING INTO @Publisher, @PublisherDB, @Publication, @Subscriber, @SubscriberDB;
+    END
+
+    CLOSE CURSOR_PENDING;
+    DEALLOCATE CURSOR_PENDING;
+
+    PRINT 'Step 6: Pending commands collected. Subscriptions analyzed: ' + CAST((SELECT COUNT(*) FROM #PENDINGCOMMANDS) AS VARCHAR);
+
+    -- ============================================================================
+    -- STEP 7: COLLECT REPLICATION ERRORS (LAST 24 HOURS)
+    -- ============================================================================
+    
+    INSERT INTO #REPLERRORS (ERROR_ID, ERROR_TIME, ERROR_TEXT, XactSeqNo, CommandID, SessionID)
+    SELECT TOP 100
+        id AS ERROR_ID,
+        [time] AS ERROR_TIME,
+        error_text AS ERROR_TEXT,
+        xact_seqno AS XactSeqNo,
+        command_id AS CommandID,
+        session_id AS SessionID
+    FROM distribution.dbo.MSrepl_errors WITH (NOLOCK)
+    WHERE [time] >= DATEADD(HOUR, -24, GETDATE())
+    ORDER BY [time] DESC;
+
+    SET @ErrorCount = @@ROWCOUNT;
+    PRINT 'Step 7: Replication errors collected. Errors in last 24 hours: ' + CAST(@ErrorCount AS VARCHAR);
+
+    -- ============================================================================
+    -- STEP 8: COLLECT REPLICATION AGENT JOB STATUS
+    -- ============================================================================
+    
+    INSERT INTO #AGENTJOBS
+    SELECT 
+        j.name AS JobName,
+        j.job_id AS JobID,
+        j.enabled AS Enabled,
+        ISNULL(js.last_run_outcome, -1) AS LastRunStatus,
+        ISNULL(js.last_run_date, 0) AS LastRunDate,
+        ISNULL(js.last_run_time, 0) AS LastRunTime,
+        CASE ISNULL(js.last_run_outcome, -1)
+            WHEN 0 THEN 'Failed'
+            WHEN 1 THEN 'Succeeded'
+            WHEN 2 THEN 'Retry'
+            WHEN 3 THEN 'Canceled'
+            ELSE 'Unknown'
+        END AS LastRunOutcome,
+        ISNULL(js.next_run_date, 0) AS NextRunDate,
+        ISNULL(js.next_run_time, 0) AS NextRunTime
+    FROM msdb.dbo.sysjobs j WITH (NOLOCK)
+    INNER JOIN msdb.dbo.syscategories c WITH (NOLOCK) ON j.category_id = c.category_id
+    LEFT JOIN msdb.dbo.sysjobservers js WITH (NOLOCK) ON j.job_id = js.job_id
+    WHERE c.name IN ('REPL-Distribution', 'REPL-LogReader', 'REPL-Snapshot', 'REPL-Merge')
+    ORDER BY j.name;
+
+    PRINT 'Step 8: Replication jobs status collected. Jobs found: ' + CAST(@@ROWCOUNT AS VARCHAR);
+
+    -- ============================================================================
+    -- STEP 9: SET LATENCY THRESHOLD (60 SECONDS RECOMMENDED)
+    -- ============================================================================
+    
+    UPDATE #REPLMONITORSUBSCRIPTION SET LATENCYTHRESHOLD = 60;
+
+    -- ============================================================================
+    -- STEP 10: CREATE FINAL COMPREHENSIVE REPORT
+    -- ============================================================================
+    
+    IF OBJECT_ID('tempdb..#ReplicationStatus360') IS NOT NULL DROP TABLE #ReplicationStatus360;
+
+    CREATE TABLE #ReplicationStatus360 (
+        Publisher SYSNAME,
+        Publisher_DB SYSNAME,
+        Publication SYSNAME,
+        Distribution_DB SYSNAME,
+        Subscriber SYSNAME,
+        Subscriber_DB SYSNAME,
+        Latency_Seconds INT,
+        Latency_Publisher_To_Distributor INT,
+        Latency_Distributor_To_Subscriber INT,
+        Last_DistSync DATETIME,
+        Minutes_Since_Last_Sync INT,
+        Pending_Commands INT,
+        Estimated_Time_To_Apply_Seconds INT,
+        Performance VARCHAR(20),
+        Warning VARCHAR(20),
+        LogReader_Status VARCHAR(50),
+        LogReader_LastRun DATETIME,
+        LogReader_DeliveredTrans INT,
+        Distribution_Status VARCHAR(50),
+        Distribution_LastRun DATETIME,
+        Distribution_DeliveredTrans INT,
+        Has_Recent_Errors BIT,
+        Latest_Error_Time DATETIME,
+        Latest_Error_Text NVARCHAR(500),
+        LogReader_Job_Enabled BIT,
+        LogReader_Job_LastOutcome VARCHAR(20),
+        Distribution_Job_Enabled BIT,
+        Distribution_Job_LastOutcome VARCHAR(20)
+    );
+
+    INSERT INTO #ReplicationStatus360
+    SELECT 
+        S.PUBLISHER,
+        S.PUBLISHER_DB,
+        S.PUBLICATION,
+        S.DISTRIBUTION_DB,
+        S.SUBSCRIBER,
+        S.SUBSCRIBER_DB,
+        S.LATENCY AS Latency_Seconds,
+        L.DELIVERY_LATENCY AS Latency_Publisher_To_Distributor,
+        D.DELIVERY_LATENCY AS Latency_Distributor_To_Subscriber,
+        S.LAST_DISTSYNC AS Last_DistSync,
+        DATEDIFF(MINUTE, S.LAST_DISTSYNC, GETDATE()) AS Minutes_Since_Last_Sync,
+        ISNULL(P.PENDINGCMDCOUNT, 0) AS Pending_Commands,
+        ISNULL(P.ESTIMATEDPROCESSTIME, 0) AS Estimated_Time_To_Apply_Seconds,
+        CASE 
+            WHEN (S.LATENCY / NULLIF(S.LATENCYTHRESHOLD, 0)) * 100 < 34 THEN 'Excellent'
+            WHEN (S.LATENCY / NULLIF(S.LATENCYTHRESHOLD, 0)) * 100 < 59 THEN 'Good'
+            WHEN (S.LATENCY / NULLIF(S.LATENCYTHRESHOLD, 0)) * 100 < 84 THEN 'Fair'
+            WHEN (S.LATENCY / NULLIF(S.LATENCYTHRESHOLD, 0)) * 100 < 99 THEN 'Poor'
+            ELSE 'Critical'
+        END AS Performance,
+        CASE S.WARNING 
+            WHEN 0 THEN 'None' 
+            WHEN 1 THEN 'Expiration' 
+            WHEN 2 THEN 'Latency' 
+            ELSE 'Unknown' 
+        END AS Warning,
+        CASE ISNULL(L.STATUS, 0)
+            WHEN 1 THEN 'Started' 
+            WHEN 2 THEN 'Stopped' 
+            WHEN 3 THEN 'In Progress' 
+            WHEN 4 THEN 'Idle' 
+            WHEN 5 THEN 'Retrying' 
+            WHEN 6 THEN 'Failed' 
+            ELSE 'Unknown' 
+        END AS LogReader_Status,
+        L.TIME AS LogReader_LastRun,
+        L.DELIVERED_TRANSACTIONS AS LogReader_DeliveredTrans,
+        CASE ISNULL(D.STATUS, 0)
+            WHEN 1 THEN 'Started' 
+            WHEN 2 THEN 'Stopped' 
+            WHEN 3 THEN 'In Progress' 
+            WHEN 4 THEN 'Idle' 
+            WHEN 5 THEN 'Retrying' 
+            WHEN 6 THEN 'Failed' 
+            ELSE 'Unknown' 
+        END AS Distribution_Status,
+        D.TIME AS Distribution_LastRun,
+        D.DELIVERED_TRANSACTIONS AS Distribution_DeliveredTrans,
+        CASE WHEN E.ERROR_ID IS NOT NULL THEN 1 ELSE 0 END AS Has_Recent_Errors,
+        E.ERROR_TIME AS Latest_Error_Time,
+        LEFT(E.ERROR_TEXT, 500) AS Latest_Error_Text,
+        CAST(ISNULL(LJ.Enabled, 0) AS BIT) AS LogReader_Job_Enabled,
+        LJ.LastRunOutcome AS LogReader_Job_LastOutcome,
+        CAST(ISNULL(DJ.Enabled, 0) AS BIT) AS Distribution_Job_Enabled,
+        DJ.LastRunOutcome AS Distribution_Job_LastOutcome
+    FROM #REPLMONITORSUBSCRIPTION S
+    LEFT JOIN #REPLLOGREADERAGENT L 
+        ON S.LOGREADERAGENTNAME = L.NAME 
+        AND S.DISTRIBUTION_DB = L.DBNAME 
+        AND S.PUBLISHER = L.PUBLISHER 
+        AND S.PUBLISHER_DB = L.PUBLISHER_DB
+    LEFT JOIN #REPLDISTRIBUTORAGENT D 
+        ON S.DISTRIBUTION_AGENTNAME = D.NAME 
+        AND S.DISTRIBUTION_DB = D.DBNAME
+        AND S.PUBLISHER = D.PUBLISHER
+        AND S.PUBLISHER_DB = D.PUBLISHER_DB
+        AND S.PUBLICATION = D.PUBLICATION 
+        AND S.SUBSCRIBER = D.SUBSCRIBER 
+        AND S.SUBSCRIBER_DB = D.SUBSCRIBER_DB
+    LEFT JOIN #PENDINGCOMMANDS P
+        ON S.PUBLISHER = P.PUBLISHER
+        AND S.PUBLISHER_DB = P.PUBLISHER_DB
+        AND S.PUBLICATION = P.PUBLICATION
+        AND S.SUBSCRIBER = P.SUBSCRIBER
+        AND S.SUBSCRIBER_DB = P.SUBSCRIBER_DB
+    LEFT JOIN (
+        SELECT E1.*
+        FROM #REPLERRORS E1
+        INNER JOIN (
+            SELECT ERROR_TEXT, MAX(ERROR_TIME) AS MaxTime
+            FROM #REPLERRORS
+            GROUP BY ERROR_TEXT
+        ) E2 ON E1.ERROR_TEXT = E2.ERROR_TEXT AND E1.ERROR_TIME = E2.MaxTime
+    ) E ON 1=1
+    LEFT JOIN #AGENTJOBS LJ ON L.JOB_ID = LJ.JobID
+    LEFT JOIN #AGENTJOBS DJ ON D.JOB_ID = DJ.JobID;
+
+    PRINT 'Step 10: Final report created.';
+
+    -- ============================================================================
+    -- DISPLAY RESULTS TO CONSOLE
+    -- ============================================================================
+    
+    PRINT '';
+    PRINT '========================================';
+    PRINT 'COMPREHENSIVE REPLICATION STATUS';
+    PRINT '========================================';
+
+    SELECT * FROM #ReplicationStatus360
+    ORDER BY 
+        CASE Performance 
+            WHEN 'Critical' THEN 1
+            WHEN 'Poor' THEN 2
+            WHEN 'Fair' THEN 3
+            WHEN 'Good' THEN 4
+            WHEN 'Excellent' THEN 5
+        END,
+        Pending_Commands DESC;
+
+    SELECT @CriticalCount = COUNT(*)
+    FROM #ReplicationStatus360
+    WHERE Performance = 'Critical' 
+       OR LogReader_Status = 'Failed' 
+       OR Distribution_Status = 'Failed'
+       OR Pending_Commands > 10000
+       OR Minutes_Since_Last_Sync > 15;
+
+    PRINT '';
+    PRINT '========================================';
+    PRINT 'RECENT REPLICATION ERRORS (Last 24h)';
+    PRINT '========================================';
+
+    SELECT 
+        ERROR_TIME,
+        LEFT(ERROR_TEXT, 200) AS Error_Summary
+    FROM #REPLERRORS
+    ORDER BY ERROR_TIME DESC;
+
+    PRINT '';
+    PRINT '========================================';
+    PRINT 'AGENT JOBS STATUS';
+    PRINT '========================================';
+
+    SELECT 
+        JobName,
+        CASE Enabled WHEN 1 THEN 'Yes' ELSE 'No' END AS Is_Enabled,
+        LastRunOutcome,
+        CASE 
+            WHEN LastRunDate > 0 THEN 
+                CONVERT(VARCHAR, 
+                    CAST(CAST(LastRunDate AS VARCHAR) + ' ' + 
+                    RIGHT('0' + CAST(LastRunTime/10000 AS VARCHAR), 2) + ':' + 
+                    RIGHT('0' + CAST((LastRunTime%10000)/100 AS VARCHAR), 2) + ':' + 
+                    RIGHT('0' + CAST(LastRunTime%100 AS VARCHAR), 2) AS DATETIME), 120)
+            ELSE 'Never'
+        END AS Last_Run_DateTime
+    FROM #AGENTJOBS
+    ORDER BY LastRunOutcome, JobName;
+
+    -- ============================================================================
+    -- STEP 11: SEND HTML EMAIL REPORT
+    -- ============================================================================
+    
+    IF EXISTS (SELECT 1 FROM #ReplicationStatus360)
+    BEGIN
+        SELECT TOP 1 @profile_name = name FROM msdb.dbo.sysmail_profile;
+        SELECT @server_name = @@SERVERNAME;
+        
+        IF @CriticalCount > 0
+            SET @subject = 'CRITICAL - ' + @server_name + ' - Replication Status (' + CAST(@CriticalCount AS VARCHAR) + ' issues)';
+        ELSE IF @ErrorCount > 0
+            SET @subject = 'WARNING - ' + @server_name + ' - Replication Status (' + CAST(@ErrorCount AS VARCHAR) + ' errors)';
+        ELSE
+            SET @subject = 'OK - ' + @server_name + ' - Replication Status Report';
+
+        SET @html = N'
+        <html>
+        <head>
+        <style>
+            body { font-family: Arial, sans-serif; font-size: 12px; }
+            h2 { color: #333; background-color: #f0f0f0; padding: 10px; border-left: 5px solid #4CAF50; }
+            h3 { color: #555; margin-top: 20px; }
+            table { border-collapse: collapse; width: 100%; margin-bottom: 20px; font-size: 11px; }
+            th { background-color: #4CAF50; color: white; padding: 8px; text-align: left; font-weight: bold; }
+            td { border: 1px solid #ddd; padding: 6px; }
+            tr:nth-child(even) { background-color: #f9f9f9; }
+            .excellent { background-color: #d4edda !important; }
+            .good { background-color: #d1ecf1 !important; }
+            .fair { background-color: #fff3cd !important; }
+            .poor { background-color: #f8d7da !important; }
+            .critical { background-color: #f5c6cb !important; font-weight: bold; color: #721c24; }
+            .status-failed { color: #dc3545; font-weight: bold; }
+            .status-retry { color: #ff6600; font-weight: bold; }
+            .status-ok { color: #28a745; }
+            .alert-box { background-color: #fff3cd; border: 2px solid #ffc107; padding: 15px; margin: 15px 0; border-radius: 5px; }
+            .summary { background-color: #e7f3ff; padding: 15px; margin: 15px 0; border-radius: 5px; }
+        </style>
+        </head>
+        <body>
+        <h2>360 Degree Replication Monitoring Report - ' + @server_name + '</h2>
+        <p><strong>Report Generated:</strong> ' + CONVERT(VARCHAR, GETDATE(), 120) + '</p>';
+
+        SET @html += '<div class="summary"><h3>Summary</h3><ul>';
+        
+        SELECT @html += '<li><strong>Total Subscriptions:</strong> ' + CAST(COUNT(*) AS VARCHAR) + '</li>'
+        FROM #ReplicationStatus360;
+        
+        SELECT @html += '<li><strong>Critical Issues:</strong> ' + CAST(COUNT(*) AS VARCHAR) + '</li>'
+        FROM #ReplicationStatus360
+        WHERE Performance = 'Critical' OR LogReader_Status = 'Failed' OR Distribution_Status = 'Failed';
+        
+        SELECT @html += '<li><strong>Total Pending Commands:</strong> ' + CAST(SUM(Pending_Commands) AS VARCHAR) + '</li>'
+        FROM #ReplicationStatus360;
+        
+        SELECT @html += '<li><strong>Errors (24h):</strong> ' + CAST(@ErrorCount AS VARCHAR) + '</li>';
+        
+        SET @html += '</ul></div>';
+
+        IF @CriticalCount > 0
+        BEGIN
+            SET @html += '<div class="alert-box">
+            <strong>ATTENTION REQUIRED:</strong> ' + CAST(@CriticalCount AS VARCHAR) + ' subscription(s) need immediate attention!
+            </div>';
+        END
+
+        SET @html += '<h3>Replication Status Details</h3>
+        <table>
+        <tr>
+            <th>Publisher DB</th>
+            <th>Publication</th>
+            <th>Subscriber</th>
+            <th>Latency (sec)</th>
+            <th>Pub to Dist</th>
+            <th>Dist to Sub</th>
+            <th>Pending Cmds</th>
+            <th>Est. Time (sec)</th>
+            <th>Performance</th>
+            <th>Last Sync</th>
+            <th>LogReader</th>
+            <th>Distributor</th>
+        </tr>';
+
+        SELECT @html += '
+        <tr class="' + LOWER(Performance) + '">
+            <td>' + ISNULL(Publisher_DB, '') + '</td>
+            <td>' + ISNULL(Publication, '') + '</td>
+            <td>' + ISNULL(Subscriber, '') + '</td>
+            <td><strong>' + CAST(ISNULL(Latency_Seconds, 0) AS VARCHAR) + '</strong></td>
+            <td>' + CAST(ISNULL(Latency_Publisher_To_Distributor, 0) AS VARCHAR) + '</td>
+            <td>' + CAST(ISNULL(Latency_Distributor_To_Subscriber, 0) AS VARCHAR) + '</td>
+            <td><strong>' + CAST(ISNULL(Pending_Commands, 0) AS VARCHAR) + '</strong></td>
+            <td>' + CAST(ISNULL(Estimated_Time_To_Apply_Seconds, 0) AS VARCHAR) + '</td>
+            <td><strong>' + Performance + '</strong></td>
+            <td>' + CONVERT(VARCHAR, Last_DistSync, 120) + '</td>
+            <td class="' + CASE 
+                WHEN LogReader_Status = 'Failed' THEN 'status-failed'
+                WHEN LogReader_Status = 'Retrying' THEN 'status-retry'
+                ELSE 'status-ok'
+            END + '">' + ISNULL(LogReader_Status, 'Unknown') + '</td>
+            <td class="' + CASE 
+                WHEN Distribution_Status = 'Failed' THEN 'status-failed'
+                WHEN Distribution_Status = 'Retrying' THEN 'status-retry'
+                ELSE 'status-ok'
+            END + '">' + ISNULL(Distribution_Status, 'Unknown') + '</td>
+        </tr>'
+        FROM #ReplicationStatus360
+        ORDER BY 
+            CASE Performance 
+                WHEN 'Critical' THEN 1 WHEN 'Poor' THEN 2 WHEN 'Fair' THEN 3 
+                WHEN 'Good' THEN 4 WHEN 'Excellent' THEN 5
+            END,
+            Pending_Commands DESC;
+
+        SET @html += '</table>';
+
+        IF @ErrorCount > 0
+        BEGIN
+            SET @html += '<h3>Recent Errors (Last 24 Hours)</h3>
+            <table>
+            <tr>
+                <th>Error Time</th>
+                <th>Error Description</th>
+            </tr>';
+
+            SELECT @html += '
+            <tr>
+                <td>' + CONVERT(VARCHAR, ERROR_TIME, 120) + '</td>
+                <td>' + LEFT(ISNULL(ERROR_TEXT, ''), 300) + '</td>
+            </tr>'
+            FROM #REPLERRORS
+            ORDER BY ERROR_TIME DESC;
+
+            SET @html += '</table>';
+        END
+
+        SET @html += '<h3>Replication Agent Jobs</h3>
+        <table>
+        <tr>
+            <th>Job Name</th>
+            <th>Enabled</th>
+            <th>Last Run Outcome</th>
+            <th>Last Run Time</th>
+        </tr>';
+
+        SELECT @html += '
+        <tr>
+            <td>' + JobName + '</td>
+            <td>' + CASE Enabled WHEN 1 THEN 'Yes' ELSE 'No' END + '</td>
+            <td class="' + CASE LastRunOutcome 
+                WHEN 'Failed' THEN 'status-failed' 
+                WHEN 'Retry' THEN 'status-retry' 
+                ELSE 'status-ok' 
+            END + '">' + LastRunOutcome + '</td>
+            <td>' + CASE 
+                WHEN LastRunDate > 0 THEN 
+                    CONVERT(VARCHAR, 
+                        CAST(CAST(LastRunDate AS VARCHAR) + ' ' + 
+                        RIGHT('0' + CAST(LastRunTime/10000 AS VARCHAR), 2) + ':' + 
+                        RIGHT('0' + CAST((LastRunTime%10000)/100 AS VARCHAR), 2) + ':' + 
+                        RIGHT('0' + CAST(LastRunTime%100 AS VARCHAR), 2) AS DATETIME), 120)
+                ELSE 'Never'
+            END + '</td>
+        </tr>'
+        FROM #AGENTJOBS
+        ORDER BY JobName;
+
+        SET @html += '</table>';
+
+        SET @html += '<hr><p style="font-size:10px; color:#777;">
+        This is an automated report. For questions, contact your DBA team.<br>
+        Latency threshold: 60 seconds | Performance ratings: Excellent (less than 34 percent), Good (less than 59 percent), Fair (less than 84 percent), Poor (less than 99 percent), Critical (greater than or equal to 99 percent)
+        </p></body></html>';
+
+        EXEC msdb.dbo.sp_send_dbmail
+            @profile_name = @profile_name,
+            @recipients = 'ag385034@ncratleos.com',
+            @subject = @subject,
+            @body = @html,
+            @body_format = 'HTML',
+            @importance = CASE WHEN @CriticalCount > 0 THEN 'High' ELSE 'Normal' END;
+
+        PRINT 'Step 11: Email sent successfully to ag385034@ncratleos.com';
+    END
+    ELSE
+    BEGIN
+        PRINT 'Step 11: No replication data found. Email not sent.';
+    END
+
+    -- ============================================================================
+    -- CLEANUP
+    -- ============================================================================
+    
+    DROP TABLE #ReplicationStatus360;
+    DROP TABLE #REPLMONITORPUBLISHER;
+    DROP TABLE #REPLMONITORSUBSCRIPTION;
+    DROP TABLE #REPLLOGREADERAGENT;
+    DROP TABLE #REPLDISTRIBUTORAGENT;
+    DROP TABLE #PENDINGCOMMANDS;
+    DROP TABLE #REPLERRORS;
+    DROP TABLE #AGENTJOBS;
+
+    PRINT '';
+    PRINT '========================================';
+    PRINT '360 REPLICATION MONITORING - COMPLETED';
+    PRINT '========================================';
+
+END TRY
+BEGIN CATCH
+    PRINT '';
+    PRINT '========================================';
+    PRINT 'ERROR OCCURRED IN MONITORING SCRIPT';
+    PRINT '========================================';
+    PRINT 'Error Message: ' + ERROR_MESSAGE();
+    PRINT 'Error Line: ' + CAST(ERROR_LINE() AS VARCHAR);
+    PRINT 'Error Procedure: ' + ISNULL(ERROR_PROCEDURE(), 'Ad-hoc query');
+
+    IF EXISTS (SELECT 1 FROM msdb.dbo.sysmail_profile)
+    BEGIN
+        SELECT TOP 1 @profile_name = name FROM msdb.dbo.sysmail_profile;
+        SELECT @server_name = @@SERVERNAME;
+        
+        EXEC msdb.dbo.sp_send_dbmail
+            @profile_name = @profile_name,
+            @recipients = 'ag385034@ncratleos.com',
+            @subject = 'REPLICATION MONITORING SCRIPT FAILED',
+            @body = 'Replication monitoring script encountered an error. Check SQL Server logs for details.',
+            @importance = 'High';
+    END
+
+    IF OBJECT_ID('tempdb..#ReplicationStatus360') IS NOT NULL DROP TABLE #ReplicationStatus360;
+    IF OBJECT_ID('tempdb..#REPLMONITORPUBLISHER') IS NOT NULL DROP TABLE #REPLMONITORPUBLISHER;
+    IF OBJECT_ID('tempdb..#REPLMONITORSUBSCRIPTION') IS NOT NULL DROP TABLE #REPLMONITORSUBSCRIPTION;
+    IF OBJECT_ID('tempdb..#REPLLOGREADERAGENT') IS NOT NULL DROP TABLE #REPLLOGREADERAGENT;
+    IF OBJECT_ID('tempdb..#REPLDISTRIBUTORAGENT') IS NOT NULL DROP TABLE #REPLDISTRIBUTORAGENT;
+    IF OBJECT_ID('tempdb..#PENDINGCOMMANDS') IS NOT NULL DROP TABLE #PENDINGCOMMANDS;
+    IF OBJECT_ID('tempdb..#REPLERRORS') IS NOT NULL DROP TABLE #REPLERRORS;
+    IF OBJECT_ID('tempdb..#AGENTJOBS') IS NOT NULL DROP TABLE #AGENTJOBS;
+
+    THROW;
+END CATCH
+```
+
+This clean version is production-ready without any emojis. It includes all the comprehensive monitoring features:
+
+- Latency breakdown (Publisher to Distributor to Subscriber)
+- Pending commands with estimated processing time
+- Agent status monitoring
+- Replication errors from last 24 hours
+- Job status tracking
+- HTML email report with color-coded performance indicators
+- Error handling and cleanup
+
+Simply update the email recipient on line 717 and execute on your Distributor server.
+
+Sources
