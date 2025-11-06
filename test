@@ -1,0 +1,26 @@
+SELECT
+    AgentType,
+    DBNAME,
+    AgentName,
+    AgentStatusCode,
+    AgentStatusText,
+    JobName,
+    JobIdHex,
+    JobEnabled,
+    JobRunStatusCode,
+    JobRunStatusText,
+    JobLastRunTime,
+    JobLastMessage,
+    Delivered_Transactions,
+    Delivery_Latency,
+    Error_ID,
+    AgentComments,
+    CASE 
+        WHEN AgentStatusCode IN (5,6)
+          OR JobRunStatusCode IN (0,2)
+          OR Error_ID IS NOT NULL
+          OR (Delivery_Latency IS NOT NULL AND Delivery_Latency > 120)
+        THEN 1 ELSE 0 
+    END AS IsProblem
+FROM #AgentWithJob
+ORDER BY IsProblem DESC, AgentType, DBNAME, AgentName;
