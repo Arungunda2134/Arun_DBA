@@ -1,0 +1,229 @@
+CREATE OR ALTER PROCEDURE sp_ManageSleepingSessions
+    @Action VARCHAR(20) = 'REPORT',  -- Options: COUNT, REPORT, DETAIL, KILL
+    @MinutesIdle INT = 30,
+    @IncludeOpenTrans BIT = NULL,  -- NULL = all, 1 = only with open trans, 0 = only without open trans
+    @DryRun BIT = 1,
+    @ExcludeWithOpenTrans BIT = 1,
+    @ExcludeLogins NVARCHAR(MAX) = NULL,
+    @ExcludePrograms NVARCHAR(MAX) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    -- Validate action
+    IF @Action NOT IN ('COUNT', 'REPORT', 'DETAIL', 'KILL')
+    BEGIN
+        PRINT 'Invalid @Action. Valid options: COUNT, REPORT, DETAIL, KILL';
+        RETURN;
+    END
+    
+    -- Create temp tables
+    IF OBJECT_ID('tempdb..#SessionData') IS NOT NULL DROP TABLE #SessionData;
+    IF OBJECT_ID('tempdb..#ExcludeLogins') IS NOT NULL DROP TABLE #ExcludeLogins;
+    IF OBJECT_ID('tempdb..#ExcludePrograms') IS NOT NULL DROP TABLE #ExcludePrograms;
+    
+    -- Parse excluded logins
+    CREATE TABLE #ExcludeLogins (login_name NVARCHAR(128));
+    IF @ExcludeLogins IS NOT NULL
+        INSERT INTO #ExcludeLogins
+        SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@ExcludeLogins, ',');
+    
+    -- Parse excluded programs
+    CREATE TABLE #ExcludePrograms (program_name NVARCHAR(128));
+    IF @ExcludePrograms IS NOT NULL
+        INSERT INTO #ExcludePrograms
+        SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@ExcludePrograms, ',');
+    
+    -- Get last 10 minutes of data
+    DECLARE @LatestCollectionTime DATETIME;
+    DECLARE @TimeWindowStart DATETIME;
+    
+    SELECT @LatestCollectionTime = MAX(collection_time) FROM session_monitor;
+    SET @TimeWindowStart = DATEADD(MINUTE, -10, @LatestCollectionTime);
+    
+    SELECT 
+        session_id, sql_text, login_name, wait_info, CPU, blocking_session_id,
+        reads, writes, used_memory, status, open_tran_count, host_name,
+        database_name, program_name, start_time, collection_time,
+        DATEDIFF(MINUTE, start_time, collection_time) AS minutes_idle,
+        ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY collection_time DESC) AS rn
+    INTO #SessionData
+    FROM session_monitor
+    WHERE collection_time >= @TimeWindowStart
+        AND status = 'sleeping'
+        AND session_id > 50;
+    
+    DELETE FROM #SessionData WHERE rn > 1;
+    ALTER TABLE #SessionData DROP COLUMN rn;
+    
+    -- =============================================
+    -- ACTION: COUNT
+    -- =============================================
+    IF @Action = 'COUNT'
+    BEGIN
+        SELECT 
+            COUNT(*) AS TotalSleepingSessions,
+            SUM(CASE WHEN ISNULL(open_tran_count, 0) > 0 THEN 1 ELSE 0 END) AS WithOpenTransactions,
+            MAX(minutes_idle) AS MaxMinutesIdle,
+            AVG(minutes_idle) AS AvgMinutesIdle
+        FROM #SessionData
+        WHERE minutes_idle >= @MinutesIdle
+            AND (@IncludeOpenTrans IS NULL 
+                OR (@IncludeOpenTrans = 1 AND ISNULL(open_tran_count, 0) > 0)
+                OR (@IncludeOpenTrans = 0 AND ISNULL(open_tran_count, 0) = 0));
+    END
+    
+    -- =============================================
+    -- ACTION: REPORT
+    -- =============================================
+    IF @Action = 'REPORT'
+    BEGIN
+        SELECT 
+            session_id, login_name, host_name, program_name, database_name,
+            minutes_idle, ISNULL(open_tran_count, 0) AS open_tran_count,
+            CASE WHEN ISNULL(open_tran_count, 0) > 0 THEN '*** OPEN TRANS ***' ELSE '' END AS alert,
+            blocking_session_id, wait_info, CPU, reads, writes, start_time
+        FROM #SessionData
+        WHERE minutes_idle >= @MinutesIdle
+            AND (@IncludeOpenTrans IS NULL 
+                OR (@IncludeOpenTrans = 1 AND ISNULL(open_tran_count, 0) > 0)
+                OR (@IncludeOpenTrans = 0 AND ISNULL(open_tran_count, 0) = 0))
+        ORDER BY open_tran_count DESC, minutes_idle DESC;
+    END
+    
+    -- =============================================
+    -- ACTION: DETAIL
+    -- =============================================
+    IF @Action = 'DETAIL'
+    BEGIN
+        SELECT 
+            session_id, login_name, host_name, program_name, database_name,
+            minutes_idle, ISNULL(open_tran_count, 0) AS open_tran_count,
+            CASE WHEN ISNULL(open_tran_count, 0) > 0 THEN '!!! OPEN TRANS !!!' ELSE '' END AS alert,
+            blocking_session_id, wait_info, CPU, reads, writes, used_memory,
+            sql_text, start_time, collection_time
+        FROM #SessionData
+        WHERE minutes_idle >= @MinutesIdle
+            AND (@IncludeOpenTrans IS NULL 
+                OR (@IncludeOpenTrans = 1 AND ISNULL(open_tran_count, 0) > 0)
+                OR (@IncludeOpenTrans = 0 AND ISNULL(open_tran_count, 0) = 0))
+        ORDER BY open_tran_count DESC, minutes_idle DESC;
+        
+        -- Summary by program
+        SELECT 
+            program_name,
+            COUNT(*) AS session_count,
+            SUM(CASE WHEN ISNULL(open_tran_count, 0) > 0 THEN 1 ELSE 0 END) AS with_open_trans,
+            AVG(minutes_idle) AS avg_minutes_idle,
+            MAX(minutes_idle) AS max_minutes_idle
+        FROM #SessionData
+        WHERE minutes_idle >= @MinutesIdle
+        GROUP BY program_name
+        ORDER BY session_count DESC;
+    END
+    
+    -- =============================================
+    -- ACTION: KILL
+    -- =============================================
+    IF @Action = 'KILL'
+    BEGIN
+        -- Verify sessions still exist
+        IF OBJECT_ID('tempdb..#CurrentSessions') IS NOT NULL DROP TABLE #CurrentSessions;
+        
+        SELECT s.session_id, s.status, s.login_name
+        INTO #CurrentSessions
+        FROM sys.dm_exec_sessions s
+        WHERE s.session_id IN (SELECT session_id FROM #SessionData WHERE minutes_idle >= @MinutesIdle)
+            AND s.status = 'sleeping'
+            AND s.session_id > 50;
+        
+        -- Build kill list
+        IF OBJECT_ID('tempdb..#SessionsToKill') IS NOT NULL DROP TABLE #SessionsToKill;
+        
+        SELECT 
+            sd.session_id, sd.login_name, sd.host_name, sd.program_name, sd.database_name,
+            sd.minutes_idle, ISNULL(sd.open_tran_count, 0) AS open_tran_count,
+            'KILL ' + CAST(sd.session_id AS VARCHAR(10)) + ';' AS kill_command
+        INTO #SessionsToKill
+        FROM #SessionData sd
+        INNER JOIN #CurrentSessions cs ON sd.session_id = cs.session_id
+        WHERE sd.minutes_idle >= @MinutesIdle
+            AND (@ExcludeWithOpenTrans = 0 OR ISNULL(sd.open_tran_count, 0) = 0)
+            AND NOT EXISTS (SELECT 1 FROM #ExcludeLogins WHERE login_name = sd.login_name)
+            AND NOT EXISTS (SELECT 1 FROM #ExcludePrograms WHERE program_name = sd.program_name);
+        
+        IF NOT EXISTS (SELECT 1 FROM #SessionsToKill)
+        BEGIN
+            PRINT 'No sessions found to kill.';
+            GOTO CleanupAndExit;
+        END
+        
+        -- DRY RUN
+        IF @DryRun = 1
+        BEGIN
+            PRINT '=== DRY RUN - Sessions that would be killed ===';
+            SELECT * FROM #SessionsToKill ORDER BY open_tran_count DESC, minutes_idle DESC;
+            
+            SELECT 
+                COUNT(*) AS TotalToKill,
+                SUM(CASE WHEN open_tran_count > 0 THEN 1 ELSE 0 END) AS WithOpenTrans
+            FROM #SessionsToKill;
+        END
+        -- ACTUAL KILL
+        ELSE
+        BEGIN
+            DECLARE @SessionID INT, @OpenTranCount INT, @KillCmd NVARCHAR(50);
+            DECLARE @LoginName NVARCHAR(128), @DBName NVARCHAR(128), @ErrorMsg NVARCHAR(500);
+            
+            CREATE TABLE #KillResults (
+                session_id INT, login_name NVARCHAR(128), database_name NVARCHAR(128),
+                open_tran_count INT, result VARCHAR(50), error_message NVARCHAR(500)
+            );
+            
+            DECLARE kill_cursor CURSOR FOR
+            SELECT session_id, open_tran_count, kill_command, login_name, database_name
+            FROM #SessionsToKill;
+            
+            OPEN kill_cursor;
+            FETCH NEXT FROM kill_cursor INTO @SessionID, @OpenTranCount, @KillCmd, @LoginName, @DBName;
+            
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                BEGIN TRY
+                    EXEC(@KillCmd);
+                    INSERT INTO #KillResults VALUES (@SessionID, @LoginName, @DBName, @OpenTranCount, 'SUCCESS', NULL);
+                    PRINT 'Killed session ' + CAST(@SessionID AS VARCHAR(10)) + ' (' + @LoginName + ')';
+                END TRY
+                BEGIN CATCH
+                    SET @ErrorMsg = ERROR_MESSAGE();
+                    INSERT INTO #KillResults VALUES (@SessionID, @LoginName, @DBName, @OpenTranCount, 'FAILED', @ErrorMsg);
+                    PRINT 'Failed session ' + CAST(@SessionID AS VARCHAR(10)) + ': ' + @ErrorMsg;
+                END CATCH
+                
+                FETCH NEXT FROM kill_cursor INTO @SessionID, @OpenTranCount, @KillCmd, @LoginName, @DBName;
+            END
+            
+            CLOSE kill_cursor;
+            DEALLOCATE kill_cursor;
+            
+            SELECT * FROM #KillResults;
+            
+            SELECT 
+                COUNT(*) AS TotalAttempted,
+                SUM(CASE WHEN result = 'SUCCESS' THEN 1 ELSE 0 END) AS Successful,
+                SUM(CASE WHEN result = 'FAILED' THEN 1 ELSE 0 END) AS Failed
+            FROM #KillResults;
+            
+            DROP TABLE #KillResults;
+        END
+        
+        DROP TABLE #SessionsToKill;
+        DROP TABLE #CurrentSessions;
+    END
+    
+CleanupAndExit:
+    DROP TABLE #SessionData;
+    DROP TABLE #ExcludeLogins;
+    DROP TABLE #ExcludePrograms;
+END
+GO
