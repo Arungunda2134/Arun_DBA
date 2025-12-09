@@ -1,0 +1,41 @@
+/* Examples
+
+-- All sleeping (any open trans)
+EXEC dbo.sp_ManageSleepingSessions
+    @Action           = 'REPORT',
+    @MinutesIdle      = 30,
+    @IncludeOpenTrans = NULL;
+
+-- Only sleeping with open tran
+EXEC dbo.sp_ManageSleepingSessions
+    @Action           = 'OPENTRAN',
+    @MinutesIdle      = 30;
+
+-- Only sleeping without open tran
+EXEC dbo.sp_ManageSleepingSessions
+    @Action           = 'DETAIL',
+    @MinutesIdle      = 60,
+    @IncludeOpenTrans = 0;
+
+-- Dry-run kill: sleeping without open tran
+EXEC dbo.sp_ManageSleepingSessions
+    @Action               = 'KILL',
+    @MinutesIdle          = 120,
+    @DryRun               = 1,
+    @ExcludeWithOpenTrans = 1;
+
+-- Kill including open tran (use with care)
+EXEC dbo.sp_ManageSleepingSessions
+    @Action               = 'KILL',
+    @MinutesIdle          = 240,
+    @DryRun               = 0,
+    @ExcludeWithOpenTrans = 0;
+
+-- Kill, excluding specific logins and programs
+EXEC dbo.sp_ManageSleepingSessions
+    @Action               = 'KILL',
+    @MinutesIdle          = 60,
+    @DryRun               = 1,
+    @ExcludeLogins        = 'sa,AppUser',
+    @ExcludePrograms      = 'Report Server,SQLAgent - TSQL JobStep';
+*/
