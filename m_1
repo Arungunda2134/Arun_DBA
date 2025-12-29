@@ -1,0 +1,666 @@
+
+USE [dba];
+GO
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
+
+CREATE OR ALTER PROCEDURE [dbo].[sp_ManageSleepingSessions_new]
+    @Action                   varchar(20) = 'REPORT',    -- COUNT, REPORT, DETAIL, OPENTRAN, KILL
+    @MinutesIdle              int = 30,
+    @IncludeOpenTrans         bit = NULL,                -- NULL = all, 1 = only with open trans, 0 = only without
+    @DryRun                   bit = 1,                   -- for KILL
+    @ExcludeWithOpenTrans     bit = 1,                   -- for KILL: 1 = skip open trans, 0 = include them
+    @ExcludeLogins            nvarchar(max) = NULL,      -- comma-separated (exact or LIKE if @UseLikeMatching = 1)
+    @ExcludePrograms          nvarchar(max) = NULL,      -- comma-separated (exact or LIKE if @UseLikeMatching = 1)
+    @CollectionWindowMinutes  int = 10,                  -- configurable window over dbo.session_monitor
+    @RefreshFromDMVs          bit = 1,                   -- refresh minutes_idle & open_tran_count from DMVs when permitted
+    @UseLikeMatching          bit = 0,                   -- use LIKE for includes/excludes if 1, exact equality if 0
+    @KillDelayMs              int = 0,                   -- delay between kills (milliseconds)
+    @PersistHistory           bit = 0,                   -- persist kill results in dba.dbo.kill_history if 1
+    @IncludeHosts             nvarchar(max) = NULL,      -- optional: comma-separated include host_name (KILL only)
+    @ExcludeHosts             nvarchar(max) = NULL,      -- optional: comma-separated exclude host_name (KILL only)
+    @IncludeDatabases         nvarchar(max) = NULL,      -- optional: comma-separated include database_name (KILL only)
+    @ExcludeDatabases         nvarchar(max) = NULL       -- optional: comma-separated exclude database_name (KILL only)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    /* Validate action */
+    IF @Action NOT IN ('COUNT','REPORT','DETAIL','OPENTRAN','KILL')
+        THROW 50001, 'Invalid @Action. Valid options: COUNT, REPORT, DETAIL, OPENTRAN, KILL', 1;
+
+    /* Permission guard for KILL */
+    IF @Action = 'KILL'
+       AND ISNULL(IS_SRVROLEMEMBER('processadmin'),0) = 0
+       AND ISNULL(IS_SRVROLEMEMBER('sysadmin'),0) = 0
+        THROW 50002, 'Insufficient permissions: requires processadmin or sysadmin.', 1;
+
+    /* If requested DMV refresh but caller lacks VIEW SERVER STATE, disable it gracefully */
+    IF @RefreshFromDMVs = 1 AND ISNULL(HAS_PERMS_BY_NAME(NULL,'SERVER','VIEW SERVER STATE'),0) <> 1
+    BEGIN
+        PRINT 'Warning: RefreshFromDMVs requested but caller lacks VIEW SERVER STATE. Falling back to monitor values.';
+        SET @RefreshFromDMVs = 0;
+    END
+
+    /* Temp cleanup */
+    IF OBJECT_ID('tempdb..#SessionData')     IS NOT NULL DROP TABLE #SessionData;
+    IF OBJECT_ID('tempdb..#ExcludeLogins')   IS NOT NULL DROP TABLE #ExcludeLogins;
+    IF OBJECT_ID('tempdb..#ExcludePrograms') IS NOT NULL DROP TABLE #ExcludePrograms;
+    IF OBJECT_ID('tempdb..#IncludeHosts')    IS NOT NULL DROP TABLE #IncludeHosts;
+    IF OBJECT_ID('tempdb..#ExcludeHosts')    IS NOT NULL DROP TABLE #ExcludeHosts;
+    IF OBJECT_ID('tempdb..#IncludeDBs')      IS NOT NULL DROP TABLE #IncludeDBs;
+    IF OBJECT_ID('tempdb..#ExcludeDBs')      IS NOT NULL DROP TABLE #ExcludeDBs;
+
+    CREATE TABLE #ExcludeLogins   (login_name    nvarchar(128) NOT NULL);
+    CREATE TABLE #ExcludePrograms (program_name  nvarchar(128) NOT NULL);
+    CREATE TABLE #IncludeHosts    (host_name     nvarchar(128) NOT NULL);
+    CREATE TABLE #ExcludeHosts    (host_name     nvarchar(128) NOT NULL);
+    CREATE TABLE #IncludeDBs      (database_name nvarchar(128) NOT NULL);
+    CREATE TABLE #ExcludeDBs      (database_name nvarchar(128) NOT NULL);
+
+    /* STRING_SPLIT-based parsing with LTRIM/RTRIM for broader compatibility */
+    IF @ExcludeLogins IS NOT NULL
+    BEGIN
+        INSERT INTO #ExcludeLogins(login_name)
+        SELECT DISTINCT LTRIM(RTRIM(value))
+        FROM STRING_SPLIT(@ExcludeLogins, ',')
+        WHERE LTRIM(RTRIM(value)) <> '';
+    END;
+
+    IF @ExcludePrograms IS NOT NULL
+    BEGIN
+        INSERT INTO #ExcludePrograms(program_name)
+        SELECT DISTINCT LTRIM(RTRIM(value))
+        FROM STRING_SPLIT(@ExcludePrograms, ',')
+        WHERE LTRIM(RTRIM(value)) <> '';
+    END;
+
+    IF @IncludeHosts IS NOT NULL
+    BEGIN
+        INSERT INTO #IncludeHosts(host_name)
+        SELECT DISTINCT LTRIM(RTRIM(value))
+        FROM STRING_SPLIT(@IncludeHosts, ',')
+        WHERE LTRIM(RTRIM(value)) <> '';
+    END;
+
+    IF @ExcludeHosts IS NOT NULL
+    BEGIN
+        INSERT INTO #ExcludeHosts(host_name)
+        SELECT DISTINCT LTRIM(RTRIM(value))
+        FROM STRING_SPLIT(@ExcludeHosts, ',')
+        WHERE LTRIM(RTRIM(value)) <> '';
+    END;
+
+    IF @IncludeDatabases IS NOT NULL
+    BEGIN
+        INSERT INTO #IncludeDBs(database_name)
+        SELECT DISTINCT LTRIM(RTRIM(value))
+        FROM STRING_SPLIT(@IncludeDatabases, ',')
+        WHERE LTRIM(RTRIM(value)) <> '';
+    END;
+
+    IF @ExcludeDatabases IS NOT NULL
+    BEGIN
+        INSERT INTO #ExcludeDBs(database_name)
+        SELECT DISTINCT LTRIM(RTRIM(value))
+        FROM STRING_SPLIT(@ExcludeDatabases, ',')
+        WHERE LTRIM(RTRIM(value)) <> '';
+    END;
+
+    /* Resolve latest window from session monitor */
+    DECLARE @LatestCollectionTime datetime;
+    DECLARE @TimeWindowStart      datetime;
+
+    SELECT @LatestCollectionTime = MAX(collection_time)
+    FROM dbo.session_monitor;
+
+    IF @LatestCollectionTime IS NULL
+        SET @LatestCollectionTime = GETDATE();
+
+    SET @TimeWindowStart = DATEADD(MINUTE, -@CollectionWindowMinutes, @LatestCollectionTime);
+
+    /* Base session set from monitor, dedupe to the latest record per session_id */
+    SELECT
+        session_id,
+        sql_text,
+        login_name,
+        wait_info,
+        CPU,
+        blocking_session_id,
+        reads,
+        writes,
+        used_memory,
+        status,
+        TRY_CONVERT(int, open_tran_count) AS open_tran_count,
+        host_name,
+        database_name,
+        program_name,
+        start_time,
+        collection_time,
+        DATEDIFF(MINUTE, start_time, collection_time) AS minutes_idle,
+        ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY collection_time DESC) AS rn
+    INTO #SessionData
+    FROM dbo.session_monitor
+    WHERE collection_time >= @TimeWindowStart
+      AND status = 'sleeping'
+      AND session_id > 50;
+
+    DELETE FROM #SessionData WHERE rn > 1;
+    ALTER TABLE #SessionData DROP COLUMN rn;
+
+    /* Optional: Refresh metrics from live DMVs for accuracy */
+    IF @RefreshFromDMVs = 1
+    BEGIN
+        /* minutes_idle from last_request_end_time */
+        ;WITH es AS (
+            SELECT session_id, last_request_end_time
+            FROM sys.dm_exec_sessions
+        )
+        UPDATE sd
+        SET sd.minutes_idle =
+            CASE
+                WHEN es.last_request_end_time IS NOT NULL
+                     THEN DATEDIFF(MINUTE, es.last_request_end_time, GETDATE())
+                ELSE sd.minutes_idle
+            END
+        FROM #SessionData AS sd
+        INNER JOIN es ON es.session_id = sd.session_id;
+
+        /* open_tran_count from dm_tran_session_transactions */
+        ;WITH st AS (
+            SELECT session_id, COUNT(*) AS open_tran_current
+            FROM sys.dm_tran_session_transactions
+            GROUP BY session_id
+        )
+        UPDATE sd
+        SET sd.open_tran_count = COALESCE(st.open_tran_current, sd.open_tran_count)
+        FROM #SessionData AS sd
+        LEFT JOIN st ON st.session_id = sd.session_id;
+    END;
+
+    /* COUNT */
+    IF @Action = 'COUNT'
+    BEGIN
+        SELECT
+            COUNT(*) AS TotalSleepingSessions,
+            SUM(CASE WHEN ISNULL(open_tran_count,0) > 0 THEN 1 ELSE 0 END) AS WithOpenTransactions,
+            MAX(minutes_idle) AS MaxMinutesIdle,
+            AVG(CAST(minutes_idle AS FLOAT)) AS AvgMinutesIdle
+        FROM #SessionData
+        WHERE minutes_idle >= @MinutesIdle
+          AND (
+                @IncludeOpenTrans IS NULL
+             OR (@IncludeOpenTrans = 1 AND ISNULL(open_tran_count,0) > 0)
+             OR (@IncludeOpenTrans = 0 AND ISNULL(open_tran_count,0) = 0)
+          );
+
+        DROP TABLE #SessionData; DROP TABLE #ExcludeLogins; DROP TABLE #ExcludePrograms;
+        DROP TABLE #IncludeHosts; DROP TABLE #ExcludeHosts; DROP TABLE #IncludeDBs; DROP TABLE #ExcludeDBs;
+        RETURN;
+    END;
+
+    /* REPORT */
+    IF @Action = 'REPORT'
+    BEGIN
+        SELECT
+            session_id,
+            login_name,
+            host_name,
+            program_name,
+            database_name,
+            minutes_idle,
+            ISNULL(open_tran_count,0) AS open_tran_count,
+            CASE WHEN ISNULL(open_tran_count,0) > 0 THEN '*** OPEN TRANS ***' ELSE '' END AS alert,
+            CASE WHEN ISNULL(open_tran_count,0) > 0
+                 THEN 'Impact: Killing will rollback open transactions, which may cause data loss, blocking resolution, and potential application errors.'
+                 ELSE 'Impact: Killing may disrupt application connection pooling, forcing reconnections and possible performance overhead.'
+            END AS ImpactNote,
+            'Additional Considerations: Verify if the session belongs to a critical application before killing. Rollback duration depends on transaction size.' AS ExtraImpactDetails,
+            blocking_session_id,
+            wait_info,
+            CPU,
+            reads,
+            writes,
+            start_time
+        FROM #SessionData
+        WHERE minutes_idle >= @MinutesIdle
+          AND (
+                @IncludeOpenTrans IS NULL
+             OR (@IncludeOpenTrans = 1 AND ISNULL(open_tran_count,0) > 0)
+             OR (@IncludeOpenTrans = 0 AND ISNULL(open_tran_count,0) = 0)
+          )
+        ORDER BY ISNULL(open_tran_count,0) DESC, minutes_idle DESC;
+
+        /* Aggregations by login and host */
+        SELECT
+            login_name,
+            COUNT(*) AS total_sleeping,
+            SUM(CASE WHEN ISNULL(open_tran_count,0) > 0 THEN 1 ELSE 0 END) AS with_open_trans,
+            AVG(CAST(minutes_idle AS FLOAT)) AS avg_minutes_idle,
+            MAX(minutes_idle) AS max_minutes_idle
+        FROM #SessionData
+        WHERE minutes_idle >= @MinutesIdle
+          AND (
+                @IncludeOpenTrans IS NULL
+             OR (@IncludeOpenTrans = 1 AND ISNULL(open_tran_count,0) > 0)
+             OR (@IncludeOpenTrans = 0 AND ISNULL(open_tran_count,0) = 0)
+          )
+        GROUP BY login_name
+        ORDER BY total_sleeping DESC, with_open_trans DESC;
+
+        SELECT
+            host_name,
+            COUNT(*) AS total_sleeping,
+            SUM(CASE WHEN ISNULL(open_tran_count,0) > 0 THEN 1 ELSE 0 END) AS with_open_trans,
+            AVG(CAST(minutes_idle AS FLOAT)) AS avg_minutes_idle,
+            MAX(minutes_idle) AS max_minutes_idle
+        FROM #SessionData
+        WHERE minutes_idle >= @MinutesIdle
+          AND (
+                @IncludeOpenTrans IS NULL
+             OR (@IncludeOpenTrans = 1 AND ISNULL(open_tran_count,0) > 0)
+             OR (@IncludeOpenTrans = 0 AND ISNULL(open_tran_count,0) = 0)
+          )
+        GROUP BY host_name
+        ORDER BY total_sleeping DESC, with_open_trans DESC;
+
+        DROP TABLE #SessionData; DROP TABLE #ExcludeLogins; DROP TABLE #ExcludePrograms;
+        DROP TABLE #IncludeHosts; DROP TABLE #ExcludeHosts; DROP TABLE #IncludeDBs; DROP TABLE #ExcludeDBs;
+        RETURN;
+    END;
+
+    /* DETAIL */
+    IF @Action = 'DETAIL'
+    BEGIN
+        SELECT
+            session_id,
+            login_name,
+            host_name,
+            program_name,
+            database_name,
+            minutes_idle,
+            ISNULL(open_tran_count,0) AS open_tran_count,
+            CASE WHEN ISNULL(open_tran_count,0) > 0 THEN '!!! OPEN TRANS !!!' ELSE '' END AS alert,
+            CASE WHEN ISNULL(open_tran_count,0) > 0
+                 THEN 'Impact: Killing will rollback open transactions, which may cause data loss, blocking resolution, and potential application errors.'
+                 ELSE 'Impact: Killing may disrupt application connection pooling, forcing reconnections and possible performance overhead.'
+            END AS ImpactNote,
+            'Additional Considerations: Verify if the session belongs to a critical application before killing. Rollback duration depends on transaction size.' AS ExtraImpactDetails,
+            blocking_session_id,
+            wait_info,
+            CPU,
+            reads,
+            writes,
+            used_memory,
+            sql_text,
+            start_time,
+            collection_time
+        FROM #SessionData
+        WHERE minutes_idle >= @MinutesIdle
+          AND (
+                @IncludeOpenTrans IS NULL
+             OR (@IncludeOpenTrans = 1 AND ISNULL(open_tran_count,0) > 0)
+             OR (@IncludeOpenTrans = 0 AND ISNULL(open_tran_count,0) = 0)
+          )
+        ORDER BY ISNULL(open_tran_count,0) DESC, minutes_idle DESC;
+
+        /* By program_name */
+        SELECT
+            program_name,
+            COUNT(*) AS session_count,
+            SUM(CASE WHEN ISNULL(open_tran_count,0) > 0 THEN 1 ELSE 0 END) AS with_open_trans,
+            AVG(CAST(minutes_idle AS FLOAT)) AS avg_minutes_idle,
+            MAX(minutes_idle) AS max_minutes_idle
+        FROM #SessionData
+        WHERE minutes_idle >= @MinutesIdle
+        GROUP BY program_name
+        ORDER BY session_count DESC;
+
+        DROP TABLE #SessionData; DROP TABLE #ExcludeLogins; DROP TABLE #ExcludePrograms;
+        DROP TABLE #IncludeHosts; DROP TABLE #ExcludeHosts; DROP TABLE #IncludeDBs; DROP TABLE #ExcludeDBs;
+        RETURN;
+    END;
+
+    /* OPENTRAN */
+    IF @Action = 'OPENTRAN'
+    BEGIN
+        SELECT
+            '!!! CRITICAL: SLEEPING WITH OPEN TRANSACTION !!!' AS ALERT,
+            session_id,
+            login_name,
+            host_name,
+            program_name,
+            database_name,
+            minutes_idle,
+            open_tran_count,
+            'Impact: Killing will rollback open transactions, which may cause data loss, blocking resolution, and potential application errors.' AS ImpactNote,
+            'Additional Considerations: Verify if the session belongs to a critical application before killing. Rollback duration depends on transaction size.' AS ExtraImpactDetails,
+            blocking_session_id,
+            wait_info,
+            CPU,
+            reads,
+            writes,
+            used_memory,
+            sql_text,
+            start_time,
+            collection_time
+        FROM #SessionData
+        WHERE ISNULL(open_tran_count,0) > 0
+          AND minutes_idle >= @MinutesIdle
+        ORDER BY open_tran_count DESC, minutes_idle DESC;
+
+        /* Summary metrics */
+        SELECT
+            COUNT(*) AS TotalSleepingWithOpenTrans,
+            SUM(open_tran_count) AS TotalOpenTransactions,
+            MAX(minutes_idle) AS LongestIdleMinutes,
+            AVG(CAST(minutes_idle AS FLOAT)) AS AvgIdleMinutes
+        FROM #SessionData
+        WHERE ISNULL(open_tran_count,0) > 0
+          AND minutes_idle >= @MinutesIdle;
+
+        SELECT
+            program_name,
+            COUNT(*) AS sessions_with_open_trans,
+            SUM(open_tran_count) AS total_open_trans,
+            MAX(minutes_idle) AS max_idle_minutes
+        FROM #SessionData
+        WHERE ISNULL(open_tran_count,0) > 0
+          AND minutes_idle >= @MinutesIdle
+        GROUP BY program_name
+        ORDER BY sessions_with_open_trans DESC;
+
+        SELECT
+            login_name,
+            COUNT(*) AS sessions_with_open_trans,
+            SUM(open_tran_count) AS total_open_trans,
+            MAX(minutes_idle) AS max_idle_minutes
+        FROM #SessionData
+        WHERE ISNULL(open_tran_count,0) > 0
+          AND minutes_idle >= @MinutesIdle
+        GROUP BY login_name
+        ORDER BY sessions_with_open_trans DESC;
+
+        DROP TABLE #SessionData; DROP TABLE #ExcludeLogins; DROP TABLE #ExcludePrograms;
+        DROP TABLE #IncludeHosts; DROP TABLE #ExcludeHosts; DROP TABLE #IncludeDBs; DROP TABLE #ExcludeDBs;
+        RETURN;
+    END;
+
+    /* KILL */
+    IF @Action = 'KILL'
+    BEGIN
+        /* Optional: ensure audit table exists if persisting history */
+        IF @PersistHistory = 1 AND OBJECT_ID(N'dba.dbo.kill_history', N'U') IS NULL
+        BEGIN
+            PRINT 'Creating audit table dba.dbo.kill_history ...';
+            EXEC('
+                CREATE TABLE dba.dbo.kill_history
+                (
+                    id               bigint IDENTITY(1,1) PRIMARY KEY,
+                    attempted_at     datetime2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+                    action           varchar(10)  NOT NULL,
+                    session_id       int          NOT NULL,
+                    login_name       nvarchar(128) NULL,
+                    host_name        nvarchar(128) NULL,
+                    program_name     nvarchar(128) NULL,
+                    database_name    nvarchar(128) NULL,
+                    minutes_idle     int          NULL,
+                    open_tran_count  int          NULL,
+                    result           varchar(50)  NOT NULL,
+                    error_message    nvarchar(500) NULL,
+                    actor            nvarchar(128) NULL
+                )
+            ');
+        END
+
+        IF OBJECT_ID('tempdb..#CurrentSessions') IS NOT NULL DROP TABLE #CurrentSessions;
+
+        SELECT
+            s.session_id,
+            s.status,
+            s.login_name,
+            s.host_name,
+            s.program_name
+        INTO #CurrentSessions
+        FROM sys.dm_exec_sessions AS s
+        WHERE s.session_id IN (
+            SELECT session_id
+            FROM #SessionData
+            WHERE minutes_idle >= @MinutesIdle
+        )
+          AND s.status = 'sleeping'
+          AND s.session_id > 50
+          AND s.is_user_process = 1;
+
+        IF OBJECT_ID('tempdb..#SessionsToKill') IS NOT NULL DROP TABLE #SessionsToKill;
+
+        /* Build base candidate set (minutes, open trans policy) */
+        ;WITH base AS (
+            SELECT sd.*
+            FROM #SessionData AS sd
+            INNER JOIN #CurrentSessions AS cs
+                ON sd.session_id = cs.session_id
+            WHERE sd.minutes_idle >= @MinutesIdle
+              AND (
+                    (@ExcludeWithOpenTrans = 1 AND ISNULL(sd.open_tran_count,0) = 0)
+                    OR @ExcludeWithOpenTrans = 0
+                  )
+        ),
+        incl AS (
+            /* Apply optional includes for host/database (exact or LIKE) */
+            SELECT b.*
+            FROM base AS b
+            WHERE
+            (
+                /* Hosts include logic */
+                NOT EXISTS (SELECT 1 FROM #IncludeHosts)
+                OR (
+                    (@UseLikeMatching = 1 AND EXISTS (SELECT 1 FROM #IncludeHosts h WHERE b.host_name LIKE h.host_name))
+                    OR (@UseLikeMatching = 0 AND EXISTS (SELECT 1 FROM #IncludeHosts h WHERE b.host_name = h.host_name))
+                )
+            )
+            AND
+            (
+                /* Databases include logic */
+                NOT EXISTS (SELECT 1 FROM #IncludeDBs)
+                OR (
+                    (@UseLikeMatching = 1 AND EXISTS (SELECT 1 FROM #IncludeDBs d WHERE b.database_name LIKE d.database_name))
+                    OR (@UseLikeMatching = 0 AND EXISTS (SELECT 1 FROM #IncludeDBs d WHERE b.database_name = d.database_name))
+                )
+            )
+        ),
+        excl AS (
+            /* Apply excludes for login/program/host/database (exact or LIKE) */
+            SELECT i.*
+            FROM incl AS i
+            WHERE
+                (
+                    @UseLikeMatching = 1
+                    AND NOT EXISTS (SELECT 1 FROM #ExcludeLogins   el WHERE i.login_name   LIKE el.login_name)
+                    AND NOT EXISTS (SELECT 1 FROM #ExcludePrograms ep WHERE i.program_name LIKE ep.program_name)
+                    AND NOT EXISTS (SELECT 1 FROM #ExcludeHosts   eh WHERE i.host_name    LIKE eh.host_name)
+                    AND NOT EXISTS (SELECT 1 FROM #ExcludeDBs     ed WHERE i.database_name LIKE ed.database_name)
+                )
+                OR
+                (
+                    @UseLikeMatching = 0
+                    AND NOT EXISTS (SELECT 1 FROM #ExcludeLogins   el WHERE el.login_name   = i.login_name)
+                    AND NOT EXISTS (SELECT 1 FROM #ExcludePrograms ep WHERE ep.program_name = i.program_name)
+                    AND NOT EXISTS (SELECT 1 FROM #ExcludeHosts   eh WHERE eh.host_name    = i.host_name)
+                    AND NOT EXISTS (SELECT 1 FROM #ExcludeDBs     ed WHERE ed.database_name = i.database_name)
+                )
+        )
+        SELECT
+            e.session_id,
+            e.login_name,
+            e.host_name,
+            e.program_name,
+            e.database_name,
+            e.minutes_idle,
+            ISNULL(e.open_tran_count,0) AS open_tran_count,
+            'KILL ' + CAST(e.session_id AS varchar(10)) AS kill_command,
+            CASE WHEN ISNULL(e.open_tran_count,0) > 0
+                 THEN 'Impact: Killing will rollback open transactions, which may cause data loss, blocking resolution, and potential application errors.'
+                 ELSE 'Impact: Killing may disrupt application connection pooling, forcing reconnections and possible performance overhead.'
+            END AS ImpactNote,
+            'Additional Considerations: Verify if the session belongs to a critical application before killing. Rollback duration depends on transaction size.' AS ExtraImpactDetails
+        INTO #SessionsToKill
+        FROM excl AS e;
+
+        IF NOT EXISTS (SELECT 1 FROM #SessionsToKill)
+        BEGIN
+            PRINT 'No sessions found to kill.';
+        END
+        ELSE IF @DryRun = 1
+        BEGIN
+            PRINT '=== DRY RUN - Sessions that would be killed ===';
+
+            SELECT
+                session_id,
+                login_name,
+                host_name,
+                program_name,
+                database_name,
+                minutes_idle,
+                open_tran_count,
+                kill_command,
+                ImpactNote,
+                ExtraImpactDetails
+            FROM #SessionsToKill
+            ORDER BY CASE WHEN ISNULL(open_tran_count,0) > 0 THEN 1 ELSE 0 END ASC,  -- safe first
+                     minutes_idle DESC;
+
+            SELECT
+                COUNT(*) AS TotalToKill,
+                SUM(CASE WHEN open_tran_count > 0 THEN 1 ELSE 0 END) AS WithOpenTrans
+            FROM #SessionsToKill;
+        END
+        ELSE
+        BEGIN
+            DECLARE @SessionID          int;
+            DECLARE @OpenTranCnt        int;
+            DECLARE @KillCmd            nvarchar(50);
+            DECLARE @LoginName          nvarchar(128);
+            DECLARE @DBName             nvarchar(128);
+            DECLARE @HostName           nvarchar(128);
+            DECLARE @ImpactNote         nvarchar(4000);
+            DECLARE @ExtraImpactDetails nvarchar(4000);
+            DECLARE @ErrorMsg           nvarchar(500);
+            DECLARE @Actor              nvarchar(128) = SUSER_SNAME();
+            DECLARE @MinutesIdleVal     int;
+
+            CREATE TABLE #KillResults
+            (
+                session_id          int,
+                login_name          nvarchar(128),
+                host_name           nvarchar(128),
+                database_name       nvarchar(128),
+                open_tran_count     int,
+                minutes_idle        int,
+                result              varchar(50),
+                error_message       nvarchar(500),
+                ImpactNote          nvarchar(4000),
+                ExtraImpactDetails  nvarchar(4000),
+                attempted_at        datetime2(3) DEFAULT SYSUTCDATETIME()
+            );
+
+            DECLARE kill_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT
+                session_id,
+                open_tran_count,
+                kill_command,
+                login_name,
+                database_name,
+                host_name,
+                ImpactNote,
+                ExtraImpactDetails,
+                minutes_idle
+            FROM #SessionsToKill
+            ORDER BY CASE WHEN ISNULL(open_tran_count,0) > 0 THEN 1 ELSE 0 END ASC,  -- safe first
+                     minutes_idle DESC;
+
+            OPEN kill_cursor;
+
+            FETCH NEXT FROM kill_cursor
+            INTO @SessionID, @OpenTranCnt, @KillCmd, @LoginName, @DBName, @HostName, @ImpactNote, @ExtraImpactDetails, @MinutesIdleVal;
+
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                BEGIN TRY
+                    EXEC(@KillCmd);
+
+                    INSERT INTO #KillResults
+                    (session_id, login_name, host_name, database_name, open_tran_count, minutes_idle, result, error_message, ImpactNote, ExtraImpactDetails)
+                    VALUES (@SessionID, @LoginName, @HostName, @DBName, @OpenTranCnt, @MinutesIdleVal, 'SUCCESS', NULL, @ImpactNote, @ExtraImpactDetails);
+
+                    PRINT 'Killed session ' + CAST(@SessionID AS varchar(10)) + ' (' + @LoginName + ')';
+                END TRY
+                BEGIN CATCH
+                    SET @ErrorMsg = ERROR_MESSAGE();
+
+                    INSERT INTO #KillResults
+                    (session_id, login_name, host_name, database_name, open_tran_count, minutes_idle, result, error_message, ImpactNote, ExtraImpactDetails)
+                    VALUES (@SessionID, @LoginName, @HostName, @DBName, @OpenTranCnt, @MinutesIdleVal, 'FAILED', @ErrorMsg, @ImpactNote, @ExtraImpactDetails);
+
+                    PRINT 'Failed session ' + CAST(@SessionID AS varchar(10)) + ': ' + @ErrorMsg;
+                END CATCH;
+
+                IF @PersistHistory = 1
+                BEGIN
+                    INSERT INTO dba.dbo.kill_history
+                    (attempted_at, action, session_id, login_name, host_name, program_name, database_name, minutes_idle, open_tran_count, result, error_message, actor)
+                    SELECT attempted_at, 'KILL', session_id, login_name, host_name, NULL, database_name, minutes_idle, open_tran_count, result, error_message, @Actor
+                    FROM #KillResults
+                    WHERE session_id = @SessionID;
+                END
+
+                /* Optional delay */
+                IF @KillDelayMs > 0
+                BEGIN
+                    DECLARE @delay nvarchar(12) =
+                        RIGHT('00' + CAST(@KillDelayMs / 3600000 AS varchar(2)), 2) + ':' +
+                        RIGHT('00' + CAST((@KillDelayMs % 3600000) / 60000 AS varchar(2)), 2) + ':' +
+                        RIGHT('00' + CAST((@KillDelayMs % 60000) / 1000 AS varchar(2)), 2) + '.' +
+                        RIGHT('000' + CAST(@KillDelayMs % 1000 AS varchar(3)), 3);
+                    WAITFOR DELAY @delay;
+                END
+
+                FETCH NEXT FROM kill_cursor
+                INTO @SessionID, @OpenTranCnt, @KillCmd, @LoginName, @DBName, @HostName, @ImpactNote, @ExtraImpactDetails, @MinutesIdleVal;
+            END;
+
+            CLOSE kill_cursor;
+            DEALLOCATE kill_cursor;
+
+            /* Return per-session results and summary */
+            SELECT * FROM #KillResults;
+
+            SELECT
+                COUNT(*) AS TotalAttempted,
+                SUM(CASE WHEN result = 'SUCCESS' THEN 1 ELSE 0 END) AS Successful,
+                SUM(CASE WHEN result = 'FAILED' THEN 1 ELSE 0 END) AS Failed
+            FROM #KillResults;
+
+            DROP TABLE #KillResults;
+        END;
+
+        IF OBJECT_ID('tempdb..#SessionsToKill') IS NOT NULL DROP TABLE #SessionsToKill;
+        IF OBJECT_ID('tempdb..#CurrentSessions') IS NOT NULL DROP TABLE #CurrentSessions;
+
+        DROP TABLE #SessionData; DROP TABLE #ExcludeLogins; DROP TABLE #ExcludePrograms;
+        DROP TABLE #IncludeHosts; DROP TABLE #ExcludeHosts; DROP TABLE #IncludeDBs; DROP TABLE #ExcludeDBs;
+        RETURN;
+    END;
+
+    /* Default cleanup (should not reach here due to returns above) */
+    IF OBJECT_ID('tempdb..#SessionData')     IS NOT NULL DROP TABLE #SessionData;
+    IF OBJECT_ID('tempdb..#ExcludeLogins')   IS NOT NULL DROP TABLE #ExcludeLogins;
+    IF OBJECT_ID('tempdb..#ExcludePrograms') IS NOT NULL DROP TABLE #ExcludePrograms;
+    IF OBJECT_ID('tempdb..#IncludeHosts')    IS NOT NULL DROP TABLE #IncludeHosts;
+    IF OBJECT_ID('tempdb..#ExcludeHosts')    IS NOT NULL DROP TABLE #ExcludeHosts;
+    IF OBJECT_ID('tempdb..#IncludeDBs')      IS NOT NULL DROP TABLE #IncludeDBs;
+    IF OBJECT_ID('tempdb..#ExcludeDBs')      IS NOT NULL DROP TABLE #ExcludeDBs;
+END;
+GO
