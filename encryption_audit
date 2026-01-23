@@ -1,0 +1,508 @@
+/******************************************************************************
+    ENCRYPTION AUDIT - 14 COMPONENTS (VALIDATED)
+******************************************************************************/
+SET NOCOUNT ON;
+
+PRINT '======================================================================';
+PRINT 'ENCRYPTION AUDIT - ' + @@SERVERNAME;
+PRINT '======================================================================';
+
+/******************************************************************************
+    1. SERVICE MASTER KEY (SMK)
+******************************************************************************/
+IF OBJECT_ID('tempdb..#SMK_Check') IS NOT NULL DROP TABLE #SMK_Check;
+CREATE TABLE #SMK_Check (
+    ServerName NVARCHAR(128),
+    Status     NVARCHAR(50),
+    Details    NVARCHAR(MAX)
+);
+
+INSERT INTO #SMK_Check 
+SELECT @@SERVERNAME, 
+       CASE WHEN name IS NOT NULL THEN 'PRESENT' ELSE 'MISSING' END,
+       CONCAT('Algorithm: ', algorithm_desc, ', Length: ', key_length)
+FROM master.sys.symmetric_keys 
+WHERE name = '##MS_ServiceMasterKey##';
+
+SELECT '1. SERVICE MASTER KEY (SMK)' AS Report;
+SELECT * FROM #SMK_Check;
+PRINT '';
+
+/******************************************************************************
+    2. DATABASE MASTER KEYS (DMKs) - FIXED
+******************************************************************************/
+IF OBJECT_ID('tempdb..#DMK_Check') IS NOT NULL DROP TABLE #DMK_Check;
+CREATE TABLE #DMK_Check (ServerName NVARCHAR(128), DatabaseName NVARCHAR(128), Status NVARCHAR(50), Details NVARCHAR(MAX));
+
+-- Use dynamic SQL to check each database
+DECLARE @dbname NVARCHAR(128);
+DECLARE @sql NVARCHAR(MAX);
+
+DECLARE db_cursor CURSOR FOR 
+SELECT name 
+FROM sys.databases 
+WHERE state = 0  -- ONLINE
+  AND name NOT IN ('tempdb')
+  AND name NOT LIKE 'ReportServer%'  -- Exclude SSRS databases
+ORDER BY name;
+
+OPEN db_cursor;
+FETCH NEXT FROM db_cursor INTO @dbname;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    -- Build SQL for each database
+    SET @sql = N'
+    USE [' + @dbname + N'];
+    
+    IF OBJECT_ID(''sys.database_master_keys'', ''V'') IS NOT NULL
+    BEGIN
+        INSERT INTO tempdb..#DMK_Check 
+        SELECT @@SERVERNAME, DB_NAME(),
+            CASE WHEN EXISTS (SELECT * FROM sys.database_master_keys) THEN
+                CASE WHEN (SELECT is_master_key_encrypted_by_server FROM sys.database_master_keys) = 1 
+                     THEN ''SMK-PROTECTED'' ELSE ''PASSWORD-ONLY'' END
+            ELSE ''NO DMK'' END,
+            CASE WHEN EXISTS (SELECT * FROM sys.database_master_keys) THEN
+                CONCAT(''Algorithm: '', (SELECT key_algorithm FROM sys.database_master_keys),
+                       '', Length: '', (SELECT key_length FROM sys.database_master_keys))
+            ELSE ''No Database Master Key'' END;
+    END
+    ELSE
+    BEGIN
+        INSERT INTO tempdb..#DMK_Check 
+        SELECT @@SERVERNAME, ''' + @dbname + N''', ''NO DMK VIEW'', ''System view not available in this database'';
+    END';
+    
+    BEGIN TRY
+        EXEC sp_executesql @sql;
+    END TRY
+    BEGIN CATCH
+        INSERT INTO tempdb..#DMK_Check 
+        VALUES (@@SERVERNAME, @dbname, 'ACCESS ERROR', 'Cannot access database: ' + ERROR_MESSAGE());
+    END CATCH
+    
+    FETCH NEXT FROM db_cursor INTO @dbname;
+END
+
+CLOSE db_cursor;
+DEALLOCATE db_cursor;
+
+SELECT '2. DATABASE MASTER KEYS (DMKs)' AS Report;
+SELECT * FROM #DMK_Check ORDER BY DatabaseName;
+PRINT '';
+/******************************************************************************
+    3. DMK BACKUP STATUS
+******************************************************************************/
+IF OBJECT_ID('tempdb..#DMKBackup_Check') IS NOT NULL DROP TABLE #DMKBackup_Check;
+CREATE TABLE #DMKBackup_Check (
+    ServerName   NVARCHAR(128),
+    DatabaseName NVARCHAR(128),
+    Status       NVARCHAR(50),
+    Details      NVARCHAR(MAX)
+);
+
+INSERT INTO #DMKBackup_Check
+SELECT @@SERVERNAME, DatabaseName,
+    CASE 
+        WHEN Status = 'PASSWORD-ONLY' THEN 'BACKUP REQUIRED'
+        WHEN Status = 'SMK-PROTECTED' THEN 'AUTO-RECOVERABLE'
+        ELSE 'NO DMK'
+    END,
+    CASE 
+        WHEN Status = 'PASSWORD-ONLY' THEN 'Backup DMK with password: BACKUP MASTER KEY TO FILE...'
+        WHEN Status = 'SMK-PROTECTED' THEN 'SMK can regenerate if needed'
+        ELSE 'No action needed'
+    END
+FROM #DMK_Check;
+
+SELECT '3. DMK BACKUP STATUS' AS Report;
+SELECT * FROM #DMKBackup_Check ORDER BY DatabaseName;
+PRINT '';
+
+/******************************************************************************
+    4. CERTIFICATES
+******************************************************************************/
+IF OBJECT_ID('tempdb..#Cert_Check') IS NOT NULL DROP TABLE #Cert_Check;
+CREATE TABLE #Cert_Check (
+    ServerName      NVARCHAR(128),
+    DatabaseName    NVARCHAR(128),
+    CertificateName NVARCHAR(128),
+    Status          NVARCHAR(50),
+    Details         NVARCHAR(MAX)
+);
+
+EXEC sp_MSforeachdb '
+USE [?];
+IF DB_ID() > 4
+BEGIN
+    INSERT INTO tempdb..#Cert_Check 
+    SELECT @@SERVERNAME, DB_NAME(), name,
+        CASE WHEN expiry_date < GETDATE() THEN ''EXPIRED''
+             WHEN expiry_date < DATEADD(DAY, 30, GETDATE()) THEN ''EXPIRING SOON''
+             WHEN pvt_key_encryption_type_desc IS NULL THEN ''NO PRIVATE KEY''
+             ELSE ''VALID'' END,
+        CONCAT(''Issuer: '', issuer_name, 
+               '', Expires: '', CONVERT(VARCHAR(10), expiry_date, 120),
+               '', Private Key: '', COALESCE(pvt_key_encryption_type_desc, ''MISSING''))
+    FROM sys.certificates;
+END
+';
+
+SELECT '4. CERTIFICATES' AS Report;
+SELECT * FROM #Cert_Check ORDER BY DatabaseName, CertificateName;
+PRINT '';
+
+/******************************************************************************
+    5. CERTIFICATE USAGE MAPPING (BACKUP PATTERN ONLY)
+******************************************************************************/
+IF OBJECT_ID('tempdb..#CertUsage_Check') IS NOT NULL DROP TABLE #CertUsage_Check;
+CREATE TABLE #CertUsage_Check (
+    ServerName      NVARCHAR(128),
+    DatabaseName    NVARCHAR(128),
+    CertificateName NVARCHAR(128),
+    UsageType       NVARCHAR(100),
+    Details         NVARCHAR(MAX)
+);
+
+EXEC sp_MSforeachdb '
+USE [?];
+IF DB_ID() > 4
+BEGIN
+    INSERT INTO tempdb..#CertUsage_Check 
+    SELECT @@SERVERNAME, DB_NAME(), name,
+           ''BACKUP (PATTERN)'',
+           ''Name matches %backup% pattern; likely for backup encryption''
+    FROM sys.certificates 
+    WHERE name LIKE ''%backup%'' OR name LIKE ''%Backup%'' OR name LIKE ''%BACKUP%'';
+END
+';
+
+SELECT '5. CERTIFICATE USAGE MAPPING' AS Report;
+SELECT * FROM #CertUsage_Check ORDER BY DatabaseName, CertificateName;
+PRINT '';
+
+/******************************************************************************
+    6. CERTIFICATE EXPIRY (ALL)
+******************************************************************************/
+IF OBJECT_ID('tempdb..#CertExpiry_Check') IS NOT NULL DROP TABLE #CertExpiry_Check;
+CREATE TABLE #CertExpiry_Check (
+    ServerName      NVARCHAR(128),
+    DatabaseName    NVARCHAR(128),
+    CertificateName NVARCHAR(128),
+    DaysUntilExpiry INT,
+    Status          NVARCHAR(50)
+);
+
+EXEC sp_MSforeachdb '
+USE [?];
+IF DB_ID() > 4
+BEGIN
+    INSERT INTO tempdb..#CertExpiry_Check 
+    SELECT @@SERVERNAME, DB_NAME(), name,
+           DATEDIFF(DAY, GETDATE(), expiry_date),
+           CASE 
+               WHEN expiry_date < GETDATE() THEN ''EXPIRED''
+               WHEN DATEDIFF(DAY, GETDATE(), expiry_date) <= 30 THEN ''EXPIRING SOON''
+               ELSE ''VALID''
+           END
+    FROM sys.certificates;
+END
+';
+
+SELECT '6. CERTIFICATE EXPIRY STATUS' AS Report;
+SELECT * FROM #CertExpiry_Check WHERE Status != 'VALID' ORDER BY DaysUntilExpiry;
+PRINT '';
+
+/******************************************************************************
+    7. TDE ENCRYPTION
+******************************************************************************/
+IF OBJECT_ID('tempdb..#TDE_Check') IS NOT NULL DROP TABLE #TDE_Check;
+CREATE TABLE #TDE_Check (
+    ServerName   NVARCHAR(128),
+    DatabaseName NVARCHAR(128),
+    Status       NVARCHAR(50),
+    Details      NVARCHAR(MAX)
+);
+
+EXEC sp_MSforeachdb '
+USE [?];
+IF DB_ID() > 4 AND DB_NAME() NOT IN (''master'', ''model'', ''msdb'', ''tempdb'')
+BEGIN
+    INSERT INTO tempdb..#TDE_Check 
+    SELECT @@SERVERNAME, DB_NAME(),
+        CASE WHEN db.is_encrypted = 1 THEN ''ENCRYPTED'' ELSE ''NOT ENCRYPTED'' END,
+        CASE WHEN db.is_encrypted = 1 THEN
+            CONCAT(''State: '', COALESCE(dek.encryption_state_desc, ''Unknown''),
+                   '', Algorithm: '', COALESCE(dek.key_algorithm, ''N/A''), 
+                   ''-'', COALESCE(CAST(dek.key_length AS VARCHAR), ''N/A''))
+        ELSE ''No TDE encryption'' END
+    FROM sys.databases db
+    LEFT JOIN sys.dm_database_encryption_keys dek ON db.database_id = dek.database_id
+    WHERE db.database_id = DB_ID();
+END
+';
+
+SELECT '7. TDE ENCRYPTION' AS Report;
+SELECT * FROM #TDE_Check ORDER BY DatabaseName;
+PRINT '';
+
+/******************************************************************************
+    8. BACKUP ENCRYPTION CERTIFICATES (MASTER)
+******************************************************************************/
+IF OBJECT_ID('tempdb..#BackupCert_Check') IS NOT NULL DROP TABLE #BackupCert_Check;
+CREATE TABLE #BackupCert_Check (
+    ServerName      NVARCHAR(128),
+    DatabaseName    NVARCHAR(128),
+    CertificateName NVARCHAR(128),
+    Status          NVARCHAR(50),
+    Details         NVARCHAR(MAX)
+);
+
+EXEC ('
+USE master;
+INSERT INTO tempdb..#BackupCert_Check 
+SELECT @@SERVERNAME, ''master'', name,
+    CASE WHEN expiry_date < GETDATE() THEN ''EXPIRED''
+         WHEN expiry_date < DATEADD(DAY, 30, GETDATE()) THEN ''EXPIRING SOON''
+         WHEN pvt_key_encryption_type_desc IS NULL THEN ''NO PRIVATE KEY''
+         ELSE ''VALID'' END,
+    CONCAT(''Expires: '', CONVERT(VARCHAR(10), expiry_date, 120),
+           '', Private Key: '', COALESCE(pvt_key_encryption_type_desc, ''MISSING''))
+FROM sys.certificates 
+WHERE name LIKE ''%backup%'' OR name LIKE ''%Backup%'' OR name LIKE ''%BACKUP%'';');
+
+SELECT '8. BACKUP ENCRYPTION CERTIFICATES' AS Report;
+SELECT * FROM #BackupCert_Check ORDER BY CertificateName;
+PRINT '';
+
+/******************************************************************************
+    9. SQL CREDENTIALS
+******************************************************************************/
+IF OBJECT_ID('tempdb..#Cred_Check') IS NOT NULL DROP TABLE #Cred_Check;
+CREATE TABLE #Cred_Check (
+    ServerName     NVARCHAR(128),
+    DatabaseName   NVARCHAR(128),
+    CredentialName NVARCHAR(128),
+    Status         NVARCHAR(50),
+    Details        NVARCHAR(MAX)
+);
+
+IF DB_ID('msdb') IS NOT NULL
+BEGIN
+    EXEC ('
+    USE msdb;
+    INSERT INTO tempdb..#Cred_Check 
+    SELECT @@SERVERNAME, ''msdb'', name, ''PRESENT'',
+           CONCAT(''Type: '', COALESCE(target_type, ''General''))
+    FROM sys.credentials;');
+END
+
+SELECT '9. SQL CREDENTIALS' AS Report;
+SELECT * FROM #Cred_Check ORDER BY CredentialName;
+PRINT '';
+
+/******************************************************************************
+    10. SQL AGENT PROXIES
+******************************************************************************/
+IF OBJECT_ID('tempdb..#Proxy_Check') IS NOT NULL DROP TABLE #Proxy_Check;
+CREATE TABLE #Proxy_Check (
+    ServerName   NVARCHAR(128),
+    DatabaseName NVARCHAR(128),
+    ProxyName    NVARCHAR(128),
+    Status       NVARCHAR(50),
+    Details      NVARCHAR(MAX)
+);
+
+IF DB_ID('msdb') IS NOT NULL
+BEGIN
+    EXEC ('
+    USE msdb;
+    INSERT INTO tempdb..#Proxy_Check 
+    SELECT @@SERVERNAME, ''msdb'', p.name,
+           CASE WHEN p.enabled = 1 THEN ''ENABLED'' ELSE ''DISABLED'' END,
+           CONCAT(''Credential: '', c.name)
+    FROM dbo.sysproxies p
+    JOIN sys.credentials c ON p.credential_id = c.credential_id;');
+END
+
+SELECT '10. SQL AGENT PROXIES' AS Report;
+SELECT * FROM #Proxy_Check ORDER BY ProxyName;
+PRINT '';
+
+/******************************************************************************
+    11. LINKED SERVER SECURITY
+******************************************************************************/
+IF OBJECT_ID('tempdb..#LinkedServer_Check') IS NOT NULL DROP TABLE #LinkedServer_Check;
+CREATE TABLE #LinkedServer_Check (
+    ServerName       NVARCHAR(128),
+    LinkedServerName NVARCHAR(128),
+    UsesCredentials  BIT,
+    SecurityMethod   NVARCHAR(100),
+    Details          NVARCHAR(MAX)
+);
+
+INSERT INTO #LinkedServer_Check
+SELECT 
+    @@SERVERNAME,
+    s.name,
+    CASE WHEN l.remote_name IS NOT NULL OR l.uses_self_credential = 1 THEN 1 ELSE 0 END AS UsesCredentials,
+    CASE 
+        WHEN l.uses_self_credential = 1 THEN 'SELF CREDENTIAL'
+        WHEN l.remote_name IS NOT NULL THEN 'EXPLICIT MAPPING'
+        ELSE 'NO MAPPING'
+    END AS SecurityMethod,
+    CONCAT('Provider: ', s.provider, ', Product: ', COALESCE(s.product, ''))
+FROM sys.servers s
+LEFT JOIN sys.linked_logins l ON s.server_id = l.server_id
+WHERE s.is_linked = 1;
+
+SELECT '11. LINKED SERVER SECURITY' AS Report;
+SELECT * FROM #LinkedServer_Check ORDER BY LinkedServerName;
+PRINT '';
+
+/******************************************************************************
+    12. SSISDB ENCRYPTION
+******************************************************************************/
+IF OBJECT_ID('tempdb..#SSISDB_Check') IS NOT NULL DROP TABLE #SSISDB_Check;
+CREATE TABLE #SSISDB_Check (
+    ServerName   NVARCHAR(128),
+    DatabaseName NVARCHAR(128),
+    Status       NVARCHAR(50),
+    Details      NVARCHAR(MAX)
+);
+
+IF DB_ID('SSISDB') IS NOT NULL
+BEGIN
+    EXEC ('
+    USE SSISDB;
+    INSERT INTO tempdb..#SSISDB_Check 
+    SELECT @@SERVERNAME, ''SSISDB'',
+           CASE WHEN (SELECT TOP(1) is_master_key_encrypted_by_server FROM sys.database_master_keys) = 1 
+                THEN ''SMK-PROTECTED'' ELSE ''PASSWORD-ONLY'' END,
+           CONCAT(''Packages: '', (SELECT COUNT(*) FROM internal.packages));');
+END
+
+SELECT '12. SSISDB ENCRYPTION' AS Report;
+SELECT * FROM #SSISDB_Check;
+PRINT '';
+
+/******************************************************************************
+    13. COLUMN ENCRYPTION
+******************************************************************************/
+IF OBJECT_ID('tempdb..#ColEnc_Check') IS NOT NULL DROP TABLE #ColEnc_Check;
+CREATE TABLE #ColEnc_Check (
+    ServerName   NVARCHAR(128),
+    DatabaseName NVARCHAR(128),
+    Status       NVARCHAR(50),
+    Details      NVARCHAR(MAX)
+);
+
+EXEC sp_MSforeachdb '
+USE [?];
+IF DB_ID() > 4
+BEGIN
+    INSERT INTO tempdb..#ColEnc_Check 
+    SELECT @@SERVERNAME, DB_NAME(),
+           CASE WHEN EXISTS (SELECT * FROM sys.columns WHERE encryption_type IS NOT NULL) 
+                THEN ''HAS COLUMN ENCRYPTION'' ELSE ''NO COLUMN ENCRYPTION'' END,
+           CONCAT(''Encrypted Columns: '', 
+                  (SELECT COUNT(*) FROM sys.columns WHERE encryption_type IS NOT NULL))
+    FROM sys.databases WHERE database_id = DB_ID();
+END
+';
+
+SELECT '13. COLUMN ENCRYPTION' AS Report;
+SELECT * FROM #ColEnc_Check WHERE Status = 'HAS COLUMN ENCRYPTION' ORDER BY DatabaseName;
+PRINT '';
+
+/******************************************************************************
+    14. KEY ALGORITHMS CHECK (WEAK ALGORITHMS)
+******************************************************************************/
+IF OBJECT_ID('tempdb..#Algo_Check') IS NOT NULL DROP TABLE #Algo_Check;
+CREATE TABLE #Algo_Check (
+    ServerName   NVARCHAR(128),
+    DatabaseName NVARCHAR(128),
+    KeyName      NVARCHAR(128),
+    Algorithm    NVARCHAR(100),
+    Status       NVARCHAR(50),
+    Details      NVARCHAR(MAX)
+);
+
+EXEC sp_MSforeachdb '
+USE [?];
+IF DB_ID() > 4
+BEGIN
+    -- Symmetric keys
+    INSERT INTO tempdb..#Algo_Check 
+    SELECT @@SERVERNAME, DB_NAME(), name, algorithm_desc,
+           CASE 
+               WHEN algorithm_desc IN (''RC4'', ''RC2'', ''DES'', ''TRIPLE_DES'') THEN ''WEAK ALGORITHM''
+               WHEN key_length < 128 THEN ''WEAK KEY LENGTH''
+               ELSE ''OK''
+           END,
+           CONCAT(''Key Length: '', key_length)
+    FROM sys.symmetric_keys 
+    WHERE name NOT IN (''##MS_DatabaseMasterKey##'', ''##MS_ServiceMasterKey##'');
+
+    -- Certificates with RSA keys
+    INSERT INTO tempdb..#Algo_Check 
+    SELECT @@SERVERNAME, DB_NAME(), name,
+           CONCAT(''RSA-'', key_length),
+           CASE WHEN key_length < 2048 THEN ''WEAK RSA LENGTH'' ELSE ''OK'' END,
+           CONCAT(''Issuer: '', issuer_name)
+    FROM sys.certificates 
+    WHERE pvt_key_encryption_type_desc IS NOT NULL;
+END
+';
+
+SELECT '14. KEY ALGORITHMS CHECK (WEAK ALGORITHMS)' AS Report;
+SELECT * FROM #Algo_Check WHERE Status LIKE 'WEAK%' ORDER BY DatabaseName, KeyName;
+PRINT '';
+
+/******************************************************************************
+    FINAL SUMMARY
+******************************************************************************/
+PRINT '======================================================================';
+PRINT 'CRITICAL ISSUES SUMMARY';
+PRINT '======================================================================';
+
+SELECT 'PASSWORD-ONLY DMK' AS Issue, DatabaseName AS Item, Details
+FROM #DMK_Check WHERE Status = 'PASSWORD-ONLY'
+UNION ALL
+SELECT 'EXPIRED CERTIFICATE', CONCAT(DatabaseName, '.', CertificateName), Details
+FROM #Cert_Check WHERE Status = 'EXPIRED'
+UNION ALL
+SELECT 'NO PRIVATE KEY', CONCAT(DatabaseName, '.', CertificateName), Details
+FROM #Cert_Check WHERE Status = 'NO PRIVATE KEY'
+UNION ALL
+SELECT 'TDE ENCRYPTED', DatabaseName, Details
+FROM #TDE_Check WHERE Status = 'ENCRYPTED'
+UNION ALL
+SELECT 'EXPIRED BACKUP CERT', CertificateName, Details
+FROM #BackupCert_Check WHERE Status = 'EXPIRED'
+UNION ALL
+SELECT 'WEAK ALGORITHM', CONCAT(DatabaseName, '.', KeyName), CONCAT(Algorithm, ' - ', Details)
+FROM #Algo_Check WHERE Status LIKE 'WEAK%'
+ORDER BY Issue, Item;
+
+PRINT '';
+PRINT '======================================================================';
+PRINT 'ALL 14 COMPONENTS AUDITED:';
+PRINT '======================================================================';
+PRINT '1. #SMK_Check - Service Master Key';
+PRINT '2. #DMK_Check - Database Master Keys';
+PRINT '3. #DMKBackup_Check - DMK Backup Status';
+PRINT '4. #Cert_Check - Certificates';
+PRINT '5. #CertUsage_Check - Certificate Usage Mapping';
+PRINT '6. #CertExpiry_Check - Certificate Expiry';
+PRINT '7. #TDE_Check - TDE Encryption';
+PRINT '8. #BackupCert_Check - Backup Encryption Certificates';
+PRINT '9. #Cred_Check - SQL Credentials';
+PRINT '10. #Proxy_Check - SQL Agent Proxies';
+PRINT '11. #LinkedServer_Check - Linked Server Security';
+PRINT '12. #SSISDB_Check - SSISDB Encryption';
+PRINT '13. #ColEnc_Check - Column Encryption';
+PRINT '14. #Algo_Check - Key Algorithms Check';
+PRINT '';
+PRINT 'Use: SELECT * FROM #TableName ORDER BY ...';
