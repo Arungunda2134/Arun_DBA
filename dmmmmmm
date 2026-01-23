@@ -1,0 +1,106 @@
+SET NOCOUNT ON;
+
+------------------------------------------------------------
+-- 1. Service Master Key (Instance Level)
+------------------------------------------------------------
+DECLARE @SMK_Status varchar(20);
+
+SELECT @SMK_Status =
+CASE 
+    WHEN EXISTS (SELECT 1 FROM sys.symmetric_keys WHERE name = '##MS_ServiceMasterKey##')
+    THEN 'SMK_PRESENT'
+    ELSE 'SMK_MISSING'
+END;
+
+------------------------------------------------------------
+-- 2. Temp table for unified inventory
+------------------------------------------------------------
+IF OBJECT_ID('tempdb..#EncryptionInventory') IS NOT NULL
+    DROP TABLE #EncryptionInventory;
+
+CREATE TABLE #EncryptionInventory
+(
+    ServerName             sysname,
+    DatabaseName           sysname,
+    CertificateName        sysname,
+    ExpiryDate             datetime,
+    ExpiryStatus           varchar(20),
+    PrivateKeyProtection   nvarchar(128),
+    DMK_Status             varchar(20),
+    SMK_Status             varchar(20),
+    ComplianceStatus       varchar(60)
+);
+
+------------------------------------------------------------
+-- 3. Loop through databases
+------------------------------------------------------------
+DECLARE @db sysname;
+DECLARE @sql nvarchar(max);
+
+DECLARE dbs CURSOR LOCAL FAST_FORWARD FOR
+SELECT name
+FROM sys.databases
+WHERE state_desc = 'ONLINE';
+
+OPEN dbs;
+FETCH NEXT FROM dbs INTO @db;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @sql = N'
+    INSERT INTO #EncryptionInventory
+    SELECT
+        @@SERVERNAME                                 AS ServerName,
+        N''' + @db + N'''                            AS DatabaseName,
+        c.name                                      AS CertificateName,
+        c.expiry_date                               AS ExpiryDate,
+        CASE 
+            WHEN c.expiry_date < GETDATE() THEN ''EXPIRED''
+            WHEN c.expiry_date < DATEADD(DAY, 90, GETDATE()) THEN ''EXPIRING_SOON''
+            ELSE ''VALID''
+        END                                         AS ExpiryStatus,
+        c.pvt_key_encryption_type_desc              AS PrivateKeyProtection,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1
+                FROM ' + QUOTENAME(@db) + N'.sys.symmetric_keys
+                WHERE name = ''##MS_DatabaseMasterKey##''
+            )
+            THEN ''DMK_PRESENT''
+            ELSE ''NO_DMK''
+        END                                         AS DMK_Status,
+        ''' + @SMK_Status + N'''                     AS SMK_Status,
+        CASE 
+            WHEN c.pvt_key_encryption_type_desc LIKE ''%MASTER_KEY%''
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM ' + QUOTENAME(@db) + N'.sys.symmetric_keys
+                     WHERE name = ''##MS_DatabaseMasterKey##''
+                 )
+            THEN ''CRITICAL: CERT WITHOUT DMK''
+            WHEN c.expiry_date < GETDATE()
+            THEN ''WARNING: CERT EXPIRED''
+            WHEN c.expiry_date < DATEADD(DAY, 90, GETDATE())
+            THEN ''WARNING: CERT EXPIRING SOON''
+            ELSE ''OK''
+        END                                         AS ComplianceStatus
+    FROM ' + QUOTENAME(@db) + N'.sys.certificates c;
+    ';
+
+    EXEC sys.sp_executesql @sql;
+
+    FETCH NEXT FROM dbs INTO @db;
+END
+
+CLOSE dbs;
+DEALLOCATE dbs;
+
+------------------------------------------------------------
+-- 4. Final Result
+------------------------------------------------------------
+SELECT *
+FROM #EncryptionInventory
+ORDER BY
+    ComplianceStatus DESC,
+    DatabaseName,
+    CertificateName;
