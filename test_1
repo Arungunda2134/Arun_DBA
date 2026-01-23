@@ -1,0 +1,113 @@
+SET NOCOUNT ON;
+ 
+IF OBJECT_ID('tempdb..#Certs') IS NOT NULL DROP TABLE #Certs;
+IF OBJECT_ID('tempdb..#Perms') IS NOT NULL DROP TABLE #Perms;
+ 
+CREATE TABLE #Certs
+(
+    DatabaseName                   sysname       NOT NULL,
+    CertificateName                sysname       NOT NULL,
+    Subject                        nvarchar(4000)     NULL,
+    Issuer                         nvarchar(4000)     NULL,
+    ValidFrom                      datetime2     NULL,
+    ValidTo                        datetime2     NULL,
+    PrivateKeyProtection           nvarchar(128) NULL,
+    Thumbprint                     varbinary(20) NULL,
+    KeyLength                      int           NULL,
+    OwnerUser                      sysname       NULL
+);
+ 
+CREATE TABLE #Perms
+(
+    DatabaseName       sysname       NOT NULL,
+    CertificateName    sysname       NOT NULL,
+    Permission         sysname       NULL,   -- CONTROL / ALTER / VIEW DEFINITION / TAKE OWNERSHIP
+    PermissionState    sysname       NULL,   -- GRANT / DENY
+    GranteePrincipal   sysname       NULL,
+    GranteeType        nvarchar(60)  NULL
+);
+ 
+/* Insert inventory + permissions from each online database */
+DECLARE @db sysname, @sql nvarchar(max);
+ 
+DECLARE dbs CURSOR LOCAL FAST_FORWARD FOR
+SELECT name
+FROM sys.databases
+WHERE state_desc = 'ONLINE';
+ 
+OPEN dbs;
+FETCH NEXT FROM dbs INTO @db;
+ 
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    /* Inventory */
+    SET @sql = N'
+    INSERT INTO #Certs
+    SELECT
+        N' + QUOTENAME(@db,'''') + N'            AS DatabaseName,
+        c.name                                   AS CertificateName,
+        c.subject                                AS Subject,
+        c.issuer_name                            AS Issuer,
+        c.start_date                             AS ValidFrom,
+        c.expiry_date                            AS ValidTo,
+        c.pvt_key_encryption_type_desc           AS PrivateKeyProtection,
+        c.thumbprint                             AS Thumbprint,
+        c.key_length                             AS KeyLength,
+        USER_NAME(c.principal_id)                AS OwnerUser
+    FROM ' + QUOTENAME(@db) + N'.sys.certificates AS c;
+    ';
+    EXEC sys.sp_executesql @sql;
+ 
+    /* Permissions on certificates */
+    SET @sql = N'
+    INSERT INTO #Perms
+    SELECT
+        N' + QUOTENAME(@db,'''') + N'            AS DatabaseName,
+        c.name                                   AS CertificateName,
+        dp.permission_name                       AS Permission,
+        dp.state_desc                            AS PermissionState,
+        grantee.name                             AS GranteePrincipal,
+        grantee.type_desc                        AS GranteeType
+    FROM ' + QUOTENAME(@db) + N'.sys.certificates AS c
+    LEFT JOIN ' + QUOTENAME(@db) + N'.sys.database_permissions AS dp
+           ON dp.class_desc = ''CERTIFICATE''
+          AND dp.major_id   = c.certificate_id
+    LEFT JOIN ' + QUOTENAME(@db) + N'.sys.database_principals AS grantee
+           ON grantee.principal_id = dp.grantee_principal_id;
+    ';
+    EXEC sys.sp_executesql @sql;
+ 
+    FETCH NEXT FROM dbs INTO @db;
+END
+ 
+CLOSE dbs;
+DEALLOCATE dbs;
+ 
+/* Single unified result set */
+SELECT
+    c.DatabaseName,
+    c.CertificateName,
+    c.Subject,
+    c.Issuer,
+    c.ValidFrom,
+    c.ValidTo,
+    c.PrivateKeyProtection,
+    c.Thumbprint,
+    c.KeyLength,
+    c.OwnerUser,
+    p.Permission,         -- NULL if no explicit grants/denies
+    p.PermissionState,    -- NULL if no explicit grants/denies
+    p.GranteePrincipal,   -- NULL if no explicit grants/denies
+    p.GranteeType         -- NULL if no explicit grants/denies
+FROM #Certs AS c
+LEFT JOIN #Perms AS p
+  ON p.DatabaseName    = c.DatabaseName
+AND p.CertificateName = c.CertificateName
+ORDER BY
+    c.DatabaseName,
+    c.CertificateName,
+    p.GranteePrincipal,
+    p.Permission;
+
+
+
